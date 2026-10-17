@@ -34,9 +34,10 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 | `25b664d628b` | Round-3 review fixes: X4 trace-replay test, replay poisoning, perf method and gates, op tests; docs | [log](reviews/25b664d628b.md) |
 | `06690863f87` | Round-4 review fixes: X4 cache_layer_idx + sp_only equality + rotated starts, cache-hit proof, traced main baseline, docs | [log](reviews/06690863f87.md) |
 | `5be86f27b90` | Round-5 review fixes: X4 cache comparison and layout alternation, gates, main-baseline patch, docs | [log](reviews/5be86f27b90.md) |
-| *(last)* | Round-6 review fixes: X4 compiles before capture, eager tp_sharded after sp_only, outputs freed (passes with trace allocation tracking), slot-extent check; K3 512k gate 2.2%; baseline patch checks replay | **pending** (next step 1) |
+| `42fc9f477b3` | Round-6 review fixes: X4 compiles before capture, eager tp_sharded after sp_only, outputs freed (passes with trace allocation tracking), slot-extent check; K3 512k gate 2.2%; baseline patch checks replay | [log](reviews/42fc9f477b3.md) |
+| *(last)* | Round-7 review fixes: no-compile assertion in X4, extent-check wording, baseline replay output zeroed first | **pending** (next step 1) |
 
-Each commit up to `5be86f27b90` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
+Each commit up to `42fc9f477b3` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
 
 ## Exit criteria (PLAN.md §0)
@@ -46,7 +47,7 @@ answered in its log.
 | X1 | `tp_shard_kv` runs unrolled-V, no `ring_mla` | ✅ | `_chunked_attn` / `_tp_gather_latent` |
 | X2 | `tp_sharded` bitwise equal to `sp_only` | ✅ | `test_mla_chunked_prefill_tp_sharded_matches_sp_only`: 58 passed on functional + golden inputs, plus 44 passed on CPU-reference inputs, with the shared slot poisoned before every forward. Exclusions: no K2.7 golden trace exists (2 skips), and the deep/production scenarios have no CPU-reference case (CPU MLA too slow); both run on functional inputs. The PR's `test_mla_chunked_prefill` `tp_sharded` matrix: 140 passed, 0 failed. |
 | X3 | No regressions | ✅ | 53 Galaxy MLA tests pass on `sp_only`, with PCCs identical to before the merge. K3 KDA carry (`kimi_k3/test_chunked_prefill.py`): 4/4. |
-| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts on a chip boundary), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise, for both the outputs and the un-striped caches, with every (user, layer) slot written. Layouts alternate: the capture stays alive through the `sp_only` pass, then eager `tp_sharded` forwards and a second replay of the same capture must still match. Every program is compiled before the capture. Each user's slots hold exactly that user's extent, which catches a transposed slot mapping. Mid-chip rotated starts are covered by the single-layer X2 scenarios. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
+| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts on a chip boundary), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise, for both the outputs and the un-striped caches, with every (user, layer) slot written. Layouts alternate: the capture stays alive through the `sp_only` pass, then eager `tp_sharded` forwards and a second replay of the same capture must still match. Every program is compiled before the capture. Rows past user 1's extent are written only in user 0's slots, which catches a transposed slot mapping. No program compiles while the trace is alive (asserted); with `TT_METAL_TRACE_ALLOC_TRACKING=1` no allocation made while it is alive is live at a replay (passes). Mid-chip rotated starts are covered by the single-layer X2 scenarios. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
 | X5 | Traced perf gate | ✅ | Two runs of the current method, 4/4 points each (below). Gates are the worst measured sample plus about 1 pp of measured noise, replacing the pre-measurement estimates. |
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities (see below) |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
@@ -117,7 +118,7 @@ export PREFILL_TORUS_XY_CERTIFIED=1 OMP_NUM_THREADS=$(nproc)
 T=models/demos/deepseek_v3_d_p/tests/test_mla.py
 scripts/run_safe_pytest.sh --run-all tests/ttnn/unit_tests/operations/experimental/test_high_bw_all_gather.py -k "outer_blocks or selected_slot_width_gather"
 scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill_tp_sharded_matches_sp_only      # X2 (golden case needs KIMI_K3_HF_MODEL)
-scripts/run_safe_pytest.sh --run-all $T::test_mla_tp_sharded_trace_replay_multi_layer             # X4
+TT_METAL_TRACE_ALLOC_TRACKING=1 scripts/run_safe_pytest.sh --run-all $T::test_mla_tp_sharded_trace_replay_multi_layer  # X4
 scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_tp_sharded_traced_perf                   # X5 (high-power host)
 scripts/run_safe_pytest.sh --run-all $T::test_mla_tp_sharded_dram_saving                           # X6
 scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8x4 and tp_sharded and (k3 or k2_7)"

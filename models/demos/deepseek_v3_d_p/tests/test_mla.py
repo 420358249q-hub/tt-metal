@@ -1974,6 +1974,9 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     traced_outs = forward_all(cache_traced, tt_hidden)
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    # Nothing may compile while the trace is alive (a new kernel binary could land on the trace's buffers). The live-
+    # buffer half of that rule is enforced only when run with TT_METAL_TRACE_ALLOC_TRACKING=1.
+    program_entries = mesh_device.num_program_cache_entries()
 
     def replay(steps, poison_base):
         for step in steps:
@@ -2013,7 +2016,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                     f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
                     "output differ from the TP-replicated (sp_only) output"
                 )
-            # Allocated while the trace is alive: free before any replay (allocation tracking rejects live ones).
+            # Allocated while the trace is alive: free before any replay (TT_METAL_TRACE_ALLOC_TRACKING=1 rejects live ones).
             for out in outs:
                 ttnn.deallocate(out)
 
@@ -2033,6 +2036,9 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
             for out in outs:
                 ttnn.deallocate(out)
         replay(range(len(_X4_STEPS)), poison_base=200)
+        assert (
+            mesh_device.num_program_cache_entries() == program_entries
+        ), "a program compiled while the trace was alive"
     finally:
         ttnn.release_trace(mesh_device, tid)
 
@@ -2048,8 +2054,8 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     nat_eager, nat_traced, nat_sp = natural(cache_eager, True), natural(cache_traced, True), natural(cache_sp, False)
     assert torch.equal(nat_traced, nat_eager), "traced and eager TP-sharded caches differ"
     assert torch.equal(nat_sp, nat_eager), "TP-replicated and TP-sharded caches differ"
-    # Every slot is written, and each user's slots hold that user's extent: user 1 never writes past row 12800 while
-    # user 0 writes to 20480, which a transposed (layer, user) slot mapping would break.
+    # Every slot is written, and rows past user 1's extent (12800) are written only in user 0's slots (user 0 writes to
+    # 20480): a transposed (layer, user) slot mapping would put user 0's rows into a user-1 slot.
     user1_end = max(start for user, start in _X4_STEPS if user == 1) + chunk
     for user in range(num_users):
         for layer in range(num_layers):
