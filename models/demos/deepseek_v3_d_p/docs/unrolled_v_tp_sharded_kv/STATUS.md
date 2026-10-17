@@ -37,9 +37,10 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 | `42fc9f477b3` | Round-6 review fixes: X4 compiles before capture, eager tp_sharded after sp_only, outputs freed (passes with trace allocation tracking), slot-extent check; K3 512k gate 2.2%; baseline patch checks replay | [log](reviews/42fc9f477b3.md) |
 | `f99bc175844` | Round-7 review fixes: no-compile assertion in X4, extent-check wording, baseline replay output zeroed first | [log](reviews/f99bc175844.md) |
 | `d4d22260987` | Round-8 review fixes: X4 program-cache snapshot taken before capture; baseline patch compiles its zeroing before capture (passes with allocation tracking) | [log](reviews/d4d22260987.md) |
-| *(last)* | Round-9 review fix: baseline patch hands the replay's output on after the timing branch | **pending** (next step 1) |
+| `239b41cb8e5` | Round-9 review fix: baseline patch hands the replay's output on after the timing branch | [log](reviews/239b41cb8e5.md) |
+| *(last)* | Review log for `239b41cb8e5` (docs only) | — |
 
-Each commit up to `d4d22260987` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
+Each code commit (up to `239b41cb8e5`) was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
 
 ## Exit criteria (PLAN.md §0)
@@ -53,8 +54,8 @@ answered in its log.
 | X5 | Traced perf gate | ✅ | Two runs of the current method, 4/4 points each (below). Gates are the worst measured sample plus about 1 pp of measured noise, replacing the pre-measurement estimates. |
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities (see below) |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
-| X8 | Defaults and CI | ◐ | `sp_only` K3 50k is unchanged on the realtime profiler (7.654 / 7.660 ms vs 7.656 ms before). The criterion asks for a traced before/after, which was not measured: only the branch's traced `sp_only` (table below). **CI legs not run** (next step 2, deliberately out of this milestone). |
-| X9 | Two reviews per commit | ◐ | Done for all commits except the last (next step 1) |
+| X8 | Defaults and CI | ◐ | `sp_only` K3 50k is unchanged on the realtime profiler (7.654 / 7.660 ms vs 7.656 ms before). The criterion asks for a traced before/after, which was not measured: only the branch's traced `sp_only` (table below). **CI legs not run** (next step 1, deliberately out of this milestone). |
+| X9 | Two reviews per commit | ✅ | Every code commit reviewed by both; the last round (`239b41cb8e5`) had no blocker or major. The final commit only adds that review's log |
 
 ### Performance (X5)
 
@@ -132,19 +133,17 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
 
 ## Next steps
 
-1. **Review the last commit** (X9): Claude Code and Codex gpt-6-astra, per PLAN.md §0. Fix blockers and majors in a
-   reviewed follow-up.
-2. **CI (X8):** run the Blaze prefill legs on this branch, i.e. the PR's K2.7/K3 `tp_sharded` `maxedge` legs and the
+1. **CI (X8):** run the Blaze prefill legs on this branch, i.e. the PR's K2.7/K3 `tp_sharded` `maxedge` legs and the
    K2.7 transformer legs. Update `K3_CHUNKED_RT_PERF_NS`: `test_mla_chunked_perf_check` still has main's 10.556 ms
    target, while this branch measures ~7.66 ms on `sp_only`.
-3. **Rebase onto main once PR #59531 merges,** dropping the merge commit.
-4. **Phase 3, overlap (optional, PLAN.md §4.4):** run the TP gather alongside CCL-free compute using sparse MLA's
+2. **Rebase onto main once PR #59531 merges,** dropping the merge commit.
+3. **Phase 3, overlap (optional, PLAN.md §4.4):** run the TP gather alongside CCL-free compute using sparse MLA's
    80/40 sub-device pattern (`tt_ccl.get_sparse_mla_overlap_resources`, `SubDeviceTraceController`). Target ≤ +0.5%
    overhead.
-5. **Follow-up, expanded K on arrival (PLAN.md §6):** unabsorbed QK at 192 wide. Napkin estimate: −21% to −26%
+4. **Follow-up, expanded K on arrival (PLAN.md §6):** unabsorbed QK at 192 wide. Napkin estimate: −21% to −26%
    attention at HiFi2. This branch keeps the latent as K's wire format and the slot at 576 columns, so the step stays
    open.
-6. **Upstream bits worth splitting out as separate PRs:**
+5. **Upstream bits worth splitting out as separate PRs:**
    - `high_bw_all_gather` `outer_block_rows` (useful on its own);
    - the review findings on PR #59531 itself, which are not this branch's code: sparse `tp_shard_kv=False` must be
      rejected, and `zero_padded_kv_cache` with `tp_axis` has no op test.
