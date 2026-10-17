@@ -15,7 +15,7 @@ rev 3.
 | X2 | `tp_sharded` output is **bitwise equal** to `sp_only` on the same seed for every 8×4 `test_mla_chunked_prefill` scenario × {cpu, golden} × {scalar, metadata}, for K3 and K2.7 | New paired test, all green |
 | X3 | No regressions: the 53 Galaxy MLA tests run in this session (K3/K2.7/Mistral4 chunked, `test_mistral_small4_mla`, llama4) pass on `sp_only`. The PR's KV-table tests and the K3 KDA-carry test pass on `tp_sharded`. | `run_safe_pytest.sh --run-all` |
 | X4 | A captured multi-layer, multi-user device trace replays bitwise equal to eager, with user and prefix changed between replays, including long → short → long | New trace test |
-| X5 | Traced-replay forward time, `tp_sharded` vs `sp_only`, serial gather: ≤ +2.5% (K3 50k), ≤ +2.0% (K3 512k), ≤ +3.0% (K2.7 50k), ≤ +3.0% (K2.7 256k). These replace the pre-measurement estimates (+1.5/+1.2/+2.0/+1.5%). They are the worst current-method sample plus about 1 pp of measured run-to-run noise; the 2026-10-17 runs measured +0.83/+1.29%, +1.06/+1.16%, +1.78/+0.81% and +1.61/+2.01%. Each layout is the median of 5 traced replays after an untimed warm-up, 2 s apart; the middle three must agree within 2%. The overlap phase (§4.4) is what removes the ~1–2%. | `test_mla_chunked_tp_sharded_traced_perf` (§5.4) |
+| X5 | Traced-replay forward time, `tp_sharded` vs `sp_only`, serial gather: ≤ +2.5% (K3 50k), ≤ +2.2% (K3 512k), ≤ +3.0% (K2.7 50k), ≤ +3.0% (K2.7 256k). These replace the pre-measurement estimates (+1.5/+1.2/+2.0/+1.5%). They are the worst current-method sample plus about 1 pp of measured run-to-run noise; the 2026-10-17 runs measured +0.83/+1.29%, +1.06/+1.16%, +1.78/+0.81% and +1.61/+2.01%. Each layout is the median of 5 traced replays after an untimed warm-up, 2 s apart; the middle three must agree within 2%. The overlap phase (§4.4) is what removes the ~1–2%. | `test_mla_chunked_tp_sharded_traced_perf` (§5.4) |
 | X6 | DRAM saving per user slot, measured as an allocation delta: ≥ 0.60 GB (K3 512k), ≥ 0.85 GB (K2.7 256k) | Memory report in the perf test |
 | X7 | `high_bw_all_gather`: the new outer-block (E1) tests and all existing tests pass (failures that also occur on main, on this machine, excepted). Device times at the four sizes are recorded. | `test_high_bw_all_gather.py` |
 | X8 | Default unchanged: `sp_only` traced perf within ±1% of before the change; `PREFILL_TP_SHARD_KV` off by default; the PR's `tp_sharded` CI legs green | CI run |
@@ -92,7 +92,7 @@ sum is kept only as the per-op breakdown. Compare `tp_sharded` against `sp_only`
 |---|---|---|---|---|
 | main `ring_mla`, traced (HiFi2) | 10.33 ms | 89.61 ms | 6.83 ms | 29.46 ms |
 | `sp_only`, traced (HiFi2) | 7.54 ms | 61.81 ms | 5.45 ms | 22.11 ms |
-| Gate, serial gather (§2), set from measurement (X5) | ≤ +2.5% | ≤ +2.0% | ≤ +3.0% | ≤ +3.0% |
+| Gate, serial gather (§2), set from measurement (X5) | ≤ +2.5% | ≤ +2.2% | ≤ +3.0% | ≤ +3.0% |
 | Gate, if the fused step (§4.4) is needed | ≤ +0.5% | ≤ +0.5% | ≤ +0.5% | ≤ +0.5% |
 
 The serial gates were first estimated from the gather's bandwidth (+1.2% to +2.0%), then set from traced runs of the

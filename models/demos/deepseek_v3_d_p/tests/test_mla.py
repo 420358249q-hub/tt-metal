@@ -1696,7 +1696,7 @@ def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
 # 256k-512k, so each gate is the worst sample plus about 1 pp.
 _TP_SHARDED_PERF_POINTS = [
     pytest.param("kimi_k3", 50 * 1024, 0.025, id="k3-50k"),
-    pytest.param("kimi_k3", 512 * 1024, 0.020, id="k3-512k"),
+    pytest.param("kimi_k3", 512 * 1024, 0.022, id="k3-512k"),
     pytest.param("kimi_k2_7", 50 * 1024, 0.030, id="k2_7-50k"),
     pytest.param("kimi_k2_7", 256 * 1024, 0.030, id="k2_7-256k"),
 ]
@@ -1962,6 +1962,13 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     cache_sp = new_cache(tp_sharded=False)
     tt_hidden = [to_device(host_hidden(0, layer)) for layer in range(num_layers)]
     set_step(*_X4_STEPS[0])
+    # Compile the sp_only programs now too (writing step 0's rows of the replicated cache, as its pass will again), so
+    # nothing is compiled -- kernel binaries are allocated -- while the trace is alive.
+    for mla_layer in layers:
+        mla_layer.set_tp_shard_kv(False)
+    forward_all(cache_sp, tt_hidden)
+    for mla_layer in layers:
+        mla_layer.set_tp_shard_kv(True)
     forward_all(cache_traced, tt_hidden)  # compile; rewrites step 0's rows with step 0's data, as the replay will
     ttnn.synchronize_device(mesh_device)
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
@@ -2006,11 +2013,25 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                     f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
                     "output differ from the TP-replicated (sp_only) output"
                 )
+            # Allocated while the trace is alive: free before any replay (allocation tracking rejects live ones).
+            for out in outs:
+                ttnn.deallocate(out)
 
-        # Back to TP-sharded after the replicated forwards: replaying the same capture must still match (nothing the
-        # sp_only calls touched may leave shared buffers or cached runtime arguments wrong for the sharded path).
+        # Back to TP-sharded after the replicated forwards: eager sharded forwards (program-cache hits with patched
+        # runtime arguments) and then the same capture replayed again must still match.
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(True)
+        for step, (user, start) in enumerate(_X4_STEPS):
+            set_step(user, start)
+            poison(300 + step)
+            outs = forward_all(cache_eager, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
+            for layer in range(num_layers):
+                got = ttnn.to_torch(outs[layer], mesh_composer=composer)
+                assert torch.equal(
+                    got, eager[step][layer]
+                ), f"eager tp_sharded after sp_only: step {step} layer {layer}"
+            for out in outs:
+                ttnn.deallocate(out)
         replay(range(len(_X4_STEPS)), poison_base=200)
     finally:
         ttnn.release_trace(mesh_device, tid)
@@ -2027,10 +2048,15 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     nat_eager, nat_traced, nat_sp = natural(cache_eager, True), natural(cache_traced, True), natural(cache_sp, False)
     assert torch.equal(nat_traced, nat_eager), "traced and eager TP-sharded caches differ"
     assert torch.equal(nat_sp, nat_eager), "TP-replicated and TP-sharded caches differ"
+    # Every slot is written, and each user's slots hold that user's extent: user 1 never writes past row 12800 while
+    # user 0 writes to 20480, which a transposed (layer, user) slot mapping would break.
+    user1_end = max(start for user, start in _X4_STEPS if user == 1) + chunk
     for user in range(num_users):
         for layer in range(num_layers):
             slot = user * num_layers + layer
             assert nat_eager[slot].abs().sum() > 0, f"cache slot of user {user} layer {layer} was never written"
+            tail = nat_eager[slot, user1_end:].abs().sum()
+            assert (tail == 0) == (user == 1), f"user {user} layer {layer}: rows past {user1_end} in the wrong slot"
     logger.success(
         f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(_X4_STEPS)} "
         f"steps x {num_layers} layers, replayed again after the sp_only pass"
