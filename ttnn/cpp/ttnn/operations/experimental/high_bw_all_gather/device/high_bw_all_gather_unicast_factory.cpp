@@ -190,9 +190,15 @@ PageGeometry derive_page_geometry(
     const bool selected_batch = operation_attributes.input_batch_index.has_value() || batch_index_from_metadata;
     const bool has_outer_extent = operation_attributes.gathered_outer_blocks.has_value();
     const bool selected_or_partial = selected_batch || has_runtime_extent || extent_from_metadata || has_outer_extent;
+    // Outer groups are counted in PAGE units: a tiled height dim between batch and the gather dim (a width
+    // gather) contributes tile rows, not element rows.
     uint32_t outer_count = block_rows > 0 ? input_shape[gather_dim] / block_rows : 1;
     for (int32_t i = 1; i < gather_dim; ++i) {
-        outer_count *= input_shape[i];
+        uint32_t extent = input_shape[i];
+        if (input_tensor.layout() == Layout::TILE && i == static_cast<int32_t>(rank) - 2) {
+            extent /= tile_spec.get_height();
+        }
+        outer_count *= extent;
     }
     uint32_t input_page_base = 0;
     uint32_t num_input_pages = input_tensor.buffer()->num_pages();
@@ -884,6 +890,20 @@ HighBwAllGatherUnicastFactory::cached_program_t HighBwAllGatherUnicastFactory::c
     // far wider than the reader's fixed prefix. Only the tensor accessor stays conditional, since it has
     // no meaningful zero form; its index is guarded instead.
     reader_compile_args.push_back(extent_from_metadata ? 1u : 0u);
+    if (operation_attributes.gathered_outer_blocks.has_value()) {
+        // Same starvation guard as the metadata extent below: the scalar block count can be patched down to ONE
+        // block on a cache hit, so one block's pages must cover every worker slice of this schedule.
+        const uint32_t pages_per_block = page_geometry.output_chunks_per_stripe / page_geometry.split_factor;
+        TT_FATAL(
+            pages_per_block >= total_slices,
+            "high_bw_all_gather gathered_outer_blocks: one {}-row block is {} pages but the schedule has {} slices "
+            "({} links x {} workers); raise outer_block_rows or reduce num_links so every worker owns a page",
+            operation_attributes.outer_block_rows,
+            pages_per_block,
+            total_slices,
+            num_links,
+            workers_per_dir);
+    }
     {
         uint32_t pages_per_slab = 0;
         uint32_t full_gathered_dim_size = 0;

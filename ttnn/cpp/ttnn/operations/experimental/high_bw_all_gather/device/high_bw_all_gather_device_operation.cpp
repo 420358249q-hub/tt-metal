@@ -201,8 +201,9 @@ void validate_gathered_prefix_metadata(const HighBwAllGatherParams& args, const 
         args.gathered_slab_global > 0,
         "high_bw_all_gather gathered_prefix_tensor requires gathered_slab_global > 0 (the block-cyclic slab "
         "width in gathered-dim elements); the reader rounds the populated prefix up to whole slabs");
+    // A row extent splits the slab across the ranks; with outer blocks the slab is only the unit of one block.
     TT_FATAL(
-        args.gathered_slab_global % args.num_devices == 0,
+        args.outer_block_rows > 0 || args.gathered_slab_global % args.num_devices == 0,
         "high_bw_all_gather gathered_slab_global {} must divide evenly across {} devices",
         args.gathered_slab_global,
         args.num_devices);
@@ -256,6 +257,9 @@ void validate_slot_extent_control_mix(const HighBwAllGatherParams& args, const H
             args.outer_block_rows,
             shape[gather_dim],
             gather_dim);
+        TT_FATAL(
+            gather_dim != rank - 1,
+            "high_bw_all_gather outer_block_rows splits a row dim; it cannot be used when gathering the last dim");
         if (tensor_args.input_tensor.layout() == Layout::TILE) {
             const uint32_t tile_h = tensor_args.input_tensor.tensor_spec().tile().get_height();
             TT_FATAL(

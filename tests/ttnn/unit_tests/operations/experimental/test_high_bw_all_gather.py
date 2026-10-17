@@ -2484,20 +2484,24 @@ def _kv_cache_like_memory_config(mesh_device, width):
 @pytest.mark.parametrize("mesh_device", [(8, 4)], indirect=True)
 @pytest.mark.parametrize("cluster_axis", [1, 0], ids=["tp_ring4", "sp_ring8"])
 @pytest.mark.parametrize("nd_sharded_input", [False, True], ids=["interleaved", "kv_cache_nd_sharded"])
+@pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.bfloat8_b], ids=["bf16", "bfp8"])
 @run_for_blackhole("high_bw_all_gather outer-block coverage requires Blackhole")
 @_AG_TRACED_AXIS
-def test_high_bw_all_gather_outer_blocks(mesh_device, cluster_axis, nd_sharded_input, ag_traced):
+def test_high_bw_all_gather_outer_blocks(mesh_device, cluster_axis, nd_sharded_input, dtype, ag_traced):
     ranks = mesh_device.shape[cluster_axis]
     rows = _OUTER_BLOCKS * _OUTER_BLOCK_ROWS
     user_slots = _META_NUM_LAYERS * 2  # 2 users x 2 layers, user-major
     torch.manual_seed(0)
     # rank r holds host[:, :, r*rows:(r+1)*rows]; distinct rows per (slot, block, rank) catch any mispairing.
     host = torch.randn(user_slots, 1, ranks * rows, _OUTER_WIDTH, dtype=torch.bfloat16)
+    if dtype == ttnn.bfloat8_b:
+        # The device holds the bfp8-rounded values; compare against the same rounding.
+        host = ttnn.to_torch(ttnn.from_torch(host, dtype=dtype, layout=ttnn.TILE_LAYOUT)).to(torch.bfloat16)
     shard_dims = [None, None]
     shard_dims[cluster_axis] = 2
     tt_in = ttnn.from_torch(
         host,
-        dtype=ttnn.bfloat16,
+        dtype=dtype,
         layout=ttnn.TILE_LAYOUT,
         device=mesh_device,
         memory_config=(
@@ -2509,14 +2513,14 @@ def test_high_bw_all_gather_outer_blocks(mesh_device, cluster_axis, nd_sharded_i
     tt_out = _make_tensor(
         mesh_device,
         torch.full(out_shape, _OUTER_SENTINEL, dtype=torch.bfloat16),
-        ttnn.bfloat16,
+        dtype,
         ttnn.TILE_LAYOUT,
         ttnn.ReplicateTensorToMesh(mesh_device),
     )
-    # (flat slot, chunk start): chunk 0 (1 block), a rotated start spanning two blocks, an aligned start, and one
-    # past capacity (clamped to every block). Slots 1 and 3 are users 0 and 1 at layer 1, so the traced arm (layer
-    # captured) runs every case; the eager arm adds layer-0 slots.
-    cases = [(1, 0), (3, 2560), (1, 5120), (3, 27000)]
+    # (flat slot, chunk start): chunk 0 (1 block), a rotated start spanning two blocks, an aligned start, one past
+    # capacity (clamped to every block), then long -> short -> long on the same program. Slots 1 and 3 are users 0
+    # and 1 at layer 1, so the traced arm (layer captured) runs every case; the eager arm adds layer-0 slots.
+    cases = [(1, 0), (3, 2560), (1, 5120), (3, 27000), (1, 0), (3, 27000)]
     if not ag_traced:
         cases += [(0, 2560), (2, 27000)]
 
@@ -2539,7 +2543,7 @@ def test_high_bw_all_gather_outer_blocks(mesh_device, cluster_axis, nd_sharded_i
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(
                 torch.full(out_shape, _OUTER_SENTINEL, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
             ),
@@ -2607,3 +2611,74 @@ def test_high_bw_all_gather_outer_blocks(mesh_device, cluster_axis, nd_sharded_i
         assert mesh_device.num_program_cache_entries() == entries
     finally:
         ttnn.release_trace(mesh_device, trace_id)
+
+
+@pytest.mark.parametrize("device_params", [_FABRIC_2D_TORUS_XY_DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(8, 4)], indirect=True)
+@run_for_blackhole("high_bw_all_gather selected-slot width gather requires Blackhole")
+def test_high_bw_all_gather_selected_slot_width_gather(mesh_device):
+    """A selected slot gathered on the WIDTH dim of a tiled tensor: the tiled height is an outer dim, counted in tile
+    rows. Counting it in element rows schedules 32x too many pages and writes past the output."""
+    ranks = mesh_device.shape[1]
+    slots, height, width = 3, 64, 64
+    torch.manual_seed(1)
+    host = torch.randn(slots, 1, height, ranks * width, dtype=torch.bfloat16)
+    tt_in = _make_tensor(
+        mesh_device,
+        host,
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=(None, 3)),
+    )
+    tt_out = _make_tensor(
+        mesh_device,
+        torch.zeros(1, 1, height, ranks * width, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+    for slot in (2, 0):
+        ttnn.experimental.high_bw_all_gather(tt_in, 3, tt_out, cluster_axis=1, num_links=2, input_batch_index=slot)
+        ttnn.synchronize_device(mesh_device)
+        for dev_tensor in ttnn.get_device_tensors(tt_out):
+            assert torch.equal(ttnn.to_torch(dev_tensor), host[slot : slot + 1]), f"slot {slot} mismatch"
+
+
+@pytest.mark.parametrize("device_params", [_FABRIC_2D_TORUS_XY_DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(8, 4)], indirect=True)
+@run_for_blackhole("high_bw_all_gather outer-block validation requires Blackhole")
+def test_high_bw_all_gather_outer_blocks_validation(mesh_device, expect_error):
+    ranks = mesh_device.shape[1]
+    rows = _OUTER_BLOCKS * _OUTER_BLOCK_ROWS
+    tt_in = _make_tensor(
+        mesh_device,
+        torch.zeros(2, 1, ranks * rows, _OUTER_WIDTH, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=(None, 2)),
+    )
+    tt_out = _make_tensor(
+        mesh_device,
+        torch.zeros(1, 1, ranks * rows, _OUTER_WIDTH, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+
+    def gather(**kwargs):
+        ttnn.experimental.high_bw_all_gather(
+            tt_in, 2, tt_out, cluster_axis=1, num_links=2, input_batch_index=0, **kwargs
+        )
+
+    with expect_error(RuntimeError, "gathered_outer_blocks requires outer_block_rows"):
+        gather(gathered_outer_blocks=1)
+    with expect_error(RuntimeError, "gathered_outer_blocks 0 must be in"):
+        gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=0)
+    with expect_error(RuntimeError, "must be in"):
+        gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=_OUTER_BLOCKS + 1)
+    with expect_error(RuntimeError, "must divide the gather dim"):
+        gather(outer_block_rows=96 * 7)
+    with expect_error(RuntimeError, "whole number of tile rows"):
+        gather(outer_block_rows=48)
+    with expect_error(RuntimeError, "cannot be combined with the row extent"):
+        gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_dim_size=ranks * _OUTER_BLOCK_ROWS)

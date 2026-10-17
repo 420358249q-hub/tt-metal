@@ -94,8 +94,9 @@ void bind_experimental_high_bw_all_gather_operation(nb::module_& mod) {
                     grows every chunk, and a replay would re-gather only the captured chunk's prefix.
                     Mutually exclusive with ``gathered_dim_size``.
                 gathered_slab_global: Block-cyclic slab width in gathered-dim elements
-                    (``chunk_local * num_devices``). Required with ``gathered_prefix_tensor`` and hashed,
-                    being structural rather than per-chunk.
+                    (``chunk_local * num_devices``). With ``outer_block_rows`` it is instead the unit of one
+                    block in the units of the start position (e.g. one global chunk). Required with
+                    ``gathered_prefix_tensor`` and hashed, being structural rather than per-chunk.
                 ready_semaphore: Optional caller-owned persistent startup semaphore. Must be
                     supplied together with ``data_valid_semaphore`` and initialized to zero on
                     the complete worker-core restriction before the first call.
