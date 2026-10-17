@@ -925,8 +925,8 @@ def _run_chunked_prefill(
                     profiled_ns += fwd_ns
                     logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (realtime profiler)")
                 elif trace_time:
-                    # Host wall-clock of ONE traced replay (as the Kimi MoE perf gate): the eager forward compiles,
-                    # the capture records it, and the replay rewrites the same cache rows with the same data.
+                    # Host wall-clock of traced replays: the eager forward compiles, the capture records it, and each
+                    # replay rewrites the same cache rows with the same data.
                     tt_out = _forward()
                     ttnn.synchronize_device(mesh_device)
                     eager_flat = ttnn.to_torch(
@@ -1689,11 +1689,10 @@ def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
     logger.success(f"✓ tp_sharded output bitwise equal to sp_only ({len(outs[True])} user(s))")
 
 
-# G3 gates for the TP-sharded cache (unrolled_v_sharded_kv_plan.md): traced forward overhead vs sp_only, with the TP
-# latent gather serial ahead of the expansion (~0.1 ms at 50k, mostly fixed latency; 0.3-0.6 ms at 256k-512k). Overheads
-# measured on a Galaxy 8x4 over four runs on 2026-10-17: K3 50k +1.15/+1.30/+0.45/+1.88%, K3 512k +1.10/+0.70/+0.94/
-# +0.99%, K2.7 50k +1.01/+1.85/+1.97/+2.16%, K2.7 256k +1.43/+1.67/+1.90/+1.67%. Each gate is the worst sample plus
-# about the run-to-run noise seen at that length (+-0.7 pp at 50k, +-0.2 pp at 256k-512k).
+# G3 gates for the TP-sharded cache (docs/unrolled_v_tp_sharded_kv/PLAN.md X5): traced forward overhead vs sp_only, with
+# the TP latent gather serial ahead of the expansion (~0.1 ms at 50k, mostly fixed latency; 0.3-0.6 ms at 256k-512k).
+# Set from two runs of this method on a Galaxy 8x4 (2026-10-17): K3 50k +0.83/+1.29%, K3 512k +1.06/+1.16%, K2.7 50k
+# +1.78/+0.81%, K2.7 256k +1.61/+2.01%, with margin for the run-to-run noise (about +-0.5 pp at 50k).
 _TP_SHARDED_PERF_POINTS = [
     pytest.param("kimi_k3", 50 * 1024, 0.025, id="k3-50k"),
     pytest.param("kimi_k3", 512 * 1024, 0.015, id="k3-512k"),
@@ -1727,7 +1726,7 @@ def test_mla_chunked_tp_sharded_traced_perf(
     """Traced-replay time of one 5k-chunk MLA forward at a long prefix, TP-sharded cache vs TP-replicated (sp_only),
     on the same build and machine. The TP-sharded path adds one TP latent gather ahead of the expansion."""
     topology = per_axis_topology(device_params["fabric_config"])
-    # One run per layout; each is the median of 3 traced replays after a warm-up replay, 2 s apart (see trace_time).
+    # One run per layout; each is the median of 5 traced replays after a warm-up replay, 2 s apart (see trace_time).
     mean = {
         tp_shard_kv: _run_chunked_prefill(
             request,
@@ -1811,9 +1810,10 @@ def test_mla_tp_sharded_dram_saving(mesh_device, device_params, config_only, var
 
 
 # X4: a captured multi-layer forward replayed with the user and prefix changed between replays, on the TP-sharded
-# cache, must equal the eager forwards bit for bit. Two layers share the TP latent slot, two users share each layer's
-# cache, and the user order makes the prefix go long -> short -> long.
-_X4_STEPS = [(0, 0), (1, 0), (0, 5120), (0, 10240), (1, 5120), (0, 15360), (1, 10240)]
+# cache, must equal the eager forwards bit for bit, and those must equal the TP-replicated (sp_only) eager forwards. Two
+# layers share the TP latent slot, two users share each layer's cache, the user order makes the prefix go long -> short
+# -> long, and user 1's starts are rotated (not chunk-aligned).
+_X4_STEPS = [(0, 0), (1, 0), (0, 5120), (0, 10240), (1, 2560), (0, 15360), (1, 7680)]
 
 
 @pytest.mark.parametrize(
@@ -1864,7 +1864,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     rope = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=seq_len_cache, chunk_size_global=chunk)
     scale_buf = rope_setup.make_llama4_scale_buffer(chunk)
 
-    def new_cache():
+    def new_cache(tp_sharded=True):
         return init_mla_kv_cache(
             cache_format=MlaKvCacheFormat.BFP8_TILE,
             hf_config=config,
@@ -1874,7 +1874,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
             sp_axis=sp_axis,
             num_kvpe_cache_layers=num_layers,
             num_users=num_users,
-            tp_axis=tp_axis,
+            tp_axis=tp_axis if tp_sharded else None,
         )
 
     hidden_dims = [None, None]
@@ -1927,6 +1927,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                 kvpe_cache=cache,
                 actual_start=None,
                 actual_end=None,
+                cache_layer_idx=layer,
                 cache_user_id=0,
                 metadata=metadata,
             )
@@ -1983,4 +1984,22 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                 )
     finally:
         ttnn.release_trace(mesh_device, tid)
-    logger.success(f"✓ traced replay bitwise equal to eager over {len(_X4_STEPS)} steps x {num_layers} layers")
+
+    # The same steps eagerly on the TP-replicated cache: the TP-sharded layer and cache indexing must give the same output.
+    for mla_layer in layers:
+        mla_layer.set_tp_shard_kv(False)
+    cache_sp = new_cache(tp_sharded=False)
+    for step, (user, start) in enumerate(_X4_STEPS):
+        set_step(user, start)
+        outs = forward_all(cache_sp, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
+        for layer in range(num_layers):
+            got = ttnn.to_torch(outs[layer], mesh_composer=composer)
+            mismatched = (got != eager[step][layer]).sum().item()
+            assert mismatched == 0, (
+                f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
+                "output differ from the TP-replicated (sp_only) output"
+            )
+    logger.success(
+        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), bitwise, over {len(_X4_STEPS)} steps x "
+        f"{num_layers} layers"
+    )

@@ -15,7 +15,7 @@ rev 3.
 | X2 | `tp_sharded` output is **bitwise equal** to `sp_only` on the same seed for every 8×4 `test_mla_chunked_prefill` scenario × {cpu, golden} × {scalar, metadata}, for K3 and K2.7 | New paired test, all green |
 | X3 | No regressions: the 53 Galaxy MLA tests run in this session (K3/K2.7/Mistral4 chunked, `test_mistral_small4_mla`, llama4) pass on `sp_only`. The PR's KV-table tests and the K3 KDA-carry test pass on `tp_sharded`. | `run_safe_pytest.sh --run-all` |
 | X4 | A captured multi-layer, multi-user device trace replays bitwise equal to eager, with user and prefix changed between replays, including long → short → long | New trace test |
-| X5 | Traced-replay forward time, `tp_sharded` vs `sp_only`, serial gather: ≤ +2.5% (K3 50k), ≤ +1.5% (K3 512k), ≤ +3.0% (K2.7 50k), ≤ +2.5% (K2.7 256k). Revised from the pre-measurement estimates (+1.5/+1.2/+2.0/+1.5%) after four runs: K3 50k +0.45 to +1.88%, K3 512k +0.70 to +1.10%, K2.7 50k +1.01 to +2.16%, K2.7 256k +1.43 to +1.90%. Each layout is the median of 5 traced replays after an untimed warm-up, 2 s apart; the middle three must agree within 2%. The overlap phase (§4.4) is what removes the ~1-2%. | New traced perf test (§5.4) |
+| X5 | Traced-replay forward time, `tp_sharded` vs `sp_only`, serial gather: ≤ +2.5% (K3 50k), ≤ +1.5% (K3 512k), ≤ +3.0% (K2.7 50k), ≤ +2.5% (K2.7 256k). These replace the pre-measurement estimates (+1.5/+1.2/+2.0/+1.5%) and were set from runs of the current method; the 2026-10-17 runs measured +0.83/+1.29%, +1.06/+1.16%, +1.78/+0.81% and +1.61/+2.01%. Each layout is the median of 5 traced replays after an untimed warm-up, 2 s apart; the middle three must agree within 2%. The overlap phase (§4.4) is what removes the ~1–2%. | `test_mla_chunked_tp_sharded_traced_perf` (§5.4) |
 | X6 | DRAM saving per user slot, measured as an allocation delta: ≥ 0.60 GB (K3 512k), ≥ 0.85 GB (K2.7 256k) | Memory report in the perf test |
 | X7 | `high_bw_all_gather`: the new outer-block (E1) tests and all existing tests pass (failures that also occur on main, on this machine, excepted). Device times at the four sizes are recorded. | `test_high_bw_all_gather.py` |
 | X8 | Default unchanged: `sp_only` traced perf within ±1% of before the change; `PREFILL_TP_SHARD_KV` off by default; the PR's `tp_sharded` CI legs green | CI run |
@@ -73,25 +73,31 @@ fallback to `ring_mla`.
   allocated once for all layers and users.
 - Expected net saving: K3 ≈ 0.69 GB per chip (24 MLA layers); K2.7 ≈ 0.93 GB (61 layers).
 
-**G3. The speed-up survives.** The metric is the **wall-clock of one traced replay of the MLA forward**, measured the
-way PR #60928 (Kimi MoE perf gate) does it:
+**G3. The speed-up survives.** The metric is the **host wall-clock of traced replays of the MLA forward**, adapted
+from PR #60928 (Kimi MoE perf gate):
 1. an untimed eager pass to compile;
-2. capture, through `SubDeviceTraceController` if the forward uses sub-devices;
-3. a small separate trace that refreshes the input before the replay;
-4. one timed replay, ending in `synchronize_device`. No warm-up, no averaging.
+2. capture;
+3. one untimed warm-up replay;
+4. five timed replays, 2 s apart, each ending in `synchronize_device`. The gate uses their median, and the middle three
+   must agree within 2%.
 
-It includes overlap and gaps, and excludes host dispatch. The realtime profiler's per-program sum is kept only as the
-per-op breakdown. Compare `tp_sharded` against `sp_only` on the same build.
+Why not a single first replay, as the MoE gate does: here the first replay after a capture runs about 2% fast at 50k,
+and back-to-back replays slow down under sustained load (+14% over 7 at K3 512k).
+
+The metric includes overlap and gaps between programs, and excludes host dispatch. The realtime profiler's per-program
+sum is kept only as the per-op breakdown. Compare `tp_sharded` against `sp_only` on the same build, and main's
+`ring_mla` timed the same way.
 
 | | K3 50k | K3 512k | K2.7 50k | K2.7 256k |
 |---|---|---|---|---|
-| `sp_only` today (HiFi2) | 7.83 ms | 57.01 ms | 5.60 ms | 21.16 ms |
-| Gate, serial gather (§2) | ≤ +1.5% | ≤ +1.2% | ≤ +2.0% | ≤ +1.5% |
+| main `ring_mla`, traced (HiFi2) | 10.33 ms | 89.61 ms | 6.83 ms | 29.46 ms |
+| `sp_only`, traced (HiFi2) | 7.54 ms | 61.81 ms | 5.45 ms | 22.11 ms |
+| Gate, serial gather (§2), set from measurement (X5) | ≤ +2.5% | ≤ +1.5% | ≤ +3.0% | ≤ +2.5% |
 | Gate, if the fused step (§4.4) is needed | ≤ +0.5% | ≤ +0.5% | ≤ +0.5% | ≤ +0.5% |
 
-The serial gates assume the gather's **device** time follows bandwidth: about 0.06 ms at 50k and 0.53 ms at 512k. The
-0.25 ms measured at 50k was wall-clock, including host dispatch and sync. Phase 0 measures device time. If the gates
-then don't hold, §4.4 is triggered.
+The serial gates were first estimated from the gather's bandwidth (+1.2% to +2.0%), then set from traced runs of the
+current method (X5). The serial gather costs about 0.1 ms at 50k (mostly fixed latency) and 0.3–0.6 ms at 256k–512k.
+§4.4 is what removes it.
 
 **G4. Identical results.** The temporary slot holds exactly the bytes the cache held before the PR, and everything
 downstream is unchanged. So `tp_sharded` output must be **bit-identical** to `sp_only` on the same seed, across the
@@ -347,9 +353,10 @@ scripts/run_safe_pytest.sh --run-all models/demos/deepseek_v3_d_p/tests/kimi_k3/
   `models/demos/deepseek_v3_d_p/tests/perf/test_kimi_moe_perf.py` from PR #60928:
   - parametrized over `variant` (k3 / k2_7), `prefill_len` (50k and 512k / 256k) and `tp_shard_kv`;
   - preload the prefix, then run an eager forward of one 5k chunk to compile;
-  - capture the forward, with a one-op trace that refreshes its input;
-  - time one replay with `time.perf_counter_ns()` around `execute_trace` + `synchronize_device`. Gate on the first
-    replay; `…_PERF_REPLAYS=N` logs more.
+  - capture the forward (MLA does not free its input, so no input-refresh trace is needed);
+  - one untimed warm-up replay, then 5 replays 2 s apart, each timed with `time.perf_counter_ns()` around
+    `execute_trace` + `synchronize_device`; gate on the median, and require the middle three to agree within 2%.
+  - Main's baseline uses the same method (a scratch copy of `trace_time` in a main worktree).
 - Keep the realtime-profiler run (`_run_chunked_prefill(..., profile=True)`) for the per-op breakdown only.
 - Both need Blackhole and a high-power host.
 

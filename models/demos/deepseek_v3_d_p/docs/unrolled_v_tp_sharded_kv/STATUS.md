@@ -8,7 +8,8 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 
 **Starting point**
 - **Unrolled-V** (branch `pjosipovic/ring-joint-sdpa-unrolled-v-mcast`, commit `7d302b0c4e1`): expands V per head
-  ahead of `ring_joint` SDPA. K3 MLA forward is 25–28% faster than main's `ring_mla`, K2.7 is 19–23% faster.
+  ahead of `ring_joint` SDPA. Measured as traced replays, K3 MLA forward is 27–31% faster than main's `ring_mla` and
+  K2.7 20–25% faster (table below).
 - **PR #59531** shards the dense KV cache over SP×TP: each chip keeps 1/32 of the cache instead of 1/8, so 4× less KV
   DRAM. As written, the two features clash: a chip can expand V only for rows it holds, and with the sharded cache
   3 of every 4 rows of its SP slab sit on TP neighbours.
@@ -30,9 +31,10 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 | `321daf1d6df` | MLA: unrolled-V on the TP-deduped cache; bitwise and perf tests | [log](reviews/321daf1d6df.md) |
 | `745a37d83fa` | Op review fixes: page-unit outer count (fixes a width-gather overrun), min-pages guard, tests | [log](reviews/745a37d83fa.md) |
 | `00ef3010018` | MLA review fixes: slot allocated at init, poisoned bitwise test, DRAM test | [log](reviews/00ef3010018.md) |
-| *(last)* | Round-3 review fixes: X4 trace-replay test, replay poisoning, perf method and gates, op tests; these docs | **pending** (next step 1) |
+| `25b664d628b` | Round-3 review fixes: X4 trace-replay test, replay poisoning, perf method and gates, op tests; docs | [log](reviews/25b664d628b.md) |
+| *(last)* | Round-4 review fixes: X4 cache_layer_idx + sp_only equality + rotated starts, cache-hit proof, traced main baseline, docs | **pending** (next step 1) |
 
-Each commit up to `00ef3010018` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
+Each commit up to `25b664d628b` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
 
 ## Exit criteria (PLAN.md §0)
@@ -40,44 +42,54 @@ answered in its log.
 | | Criterion | Status | Evidence |
 |---|---|---|---|
 | X1 | `tp_shard_kv` runs unrolled-V, no `ring_mla` | ✅ | `_chunked_attn` / `_tp_gather_latent` |
-| X2 | `tp_sharded` bitwise equal to `sp_only` | ✅ | `test_mla_chunked_prefill_tp_sharded_matches_sp_only`: 58 passed (2 skipped: no K2.7 golden trace) on functional + golden inputs, plus 44 passed on CPU-reference inputs. The shared slot is poisoned before every forward. The PR's `test_mla_chunked_prefill` `tp_sharded` matrix: 140 passed, 0 failed. |
+| X2 | `tp_sharded` bitwise equal to `sp_only` | ✅ | `test_mla_chunked_prefill_tp_sharded_matches_sp_only`: 58 passed on functional + golden inputs, plus 44 passed on CPU-reference inputs, with the shared slot poisoned before every forward. Exclusions: no K2.7 golden trace exists (2 skips), and the deep/production scenarios have no CPU-reference case (CPU MLA too slow); both run on functional inputs. The PR's `test_mla_chunked_prefill` `tp_sharded` matrix: 140 passed, 0 failed. |
 | X3 | No regressions | ✅ | 53 Galaxy MLA tests pass on `sp_only`, with PCCs identical to before the merge. K3 KDA carry (`kimi_k3/test_chunked_prefill.py`): 4/4. |
-| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers, 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long), slot poisoned before every replay, bitwise equal to eager. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
-| X5 | Traced perf gate | ◐ | See below. Gates revised from pre-measurement estimates. Last run: 3/4 pass; K3 50k failed only the replay-agreement check (1.02% vs 1%), which is now 2% and **not yet re-run** (next step 1). |
+| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
+| X5 | Traced perf gate | ✅ | Two runs of the current method, 4/4 points each (below). Gates were set from measurement, replacing the pre-measurement estimates. |
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities (see below) |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
-| X8 | Defaults and CI | ◐ | `sp_only` K3 perf unchanged: 7.654 / 7.660 ms vs 7.656 ms before. **CI legs not run yet** (next step 2). |
+| X8 | Defaults and CI | ◐ | `sp_only` K3 50k realtime-profiler time unchanged: 7.654 / 7.660 ms vs 7.656 ms before. **CI legs not run** (next step 2, deliberately out of this milestone). |
 | X9 | Two reviews per commit | ◐ | Done for all commits except the last (next step 1) |
 
 ### Performance (X5)
 
-Traced replay of one 5k-chunk MLA forward, `tp_sharded` vs `sp_only`, same build:
+All numbers are **traced replays** of one 5k-chunk MLA forward on the same Galaxy: an untimed warm-up replay, then
+the median of 5 replays 2 s apart (the middle three must agree within 2%). Main's `ring_mla` was timed the same way in
+a main worktree (merge-base `a7a3bc8f603`).
 
-| Point | Overheads over 5 runs | Gate |
-|---|---|---|
-| K3 50k | +1.15, +1.30, +0.45, +1.88% (last run: replay agreement 1.02%, no overhead reported) | +2.5% |
-| K3 512k | +1.10, +0.70, +0.94, +0.99, +0.84% | +1.5% |
-| K2.7 50k | +1.01, +1.85, +1.97, +2.16, +1.22% | +3.0% |
-| K2.7 256k | +1.43, +1.67, +1.90, +1.67, +1.58% | +2.5% |
+| Point | main `ring_mla` | unrolled-V `sp_only` | unrolled-V `tp_sharded` | Speed-up kept with the sharded cache |
+|---|---|---|---|---|
+| K3 50k | 10.329 ms | 7.542 ms (−27.0%) | 7.605 ms (−26.4%) | 98% |
+| K3 512k | 89.613 ms | 61.810 ms (−31.0%) | 62.462 ms (−30.3%) | 98% |
+| K2.7 50k | 6.832 ms | 5.451 ms (−20.2%) | 5.548 ms (−18.8%) | 93% |
+| K2.7 256k | 29.462 ms | 22.110 ms (−25.0%) | 22.466 ms (−23.7%) | 95% |
 
-- **Absolute numbers:** for example K3 512k `sp_only` 61.8 ms against `tp_sharded` 62.4 ms. Against main's
-  `ring_mla`, the branch keeps about 95–98% of unrolled-V's speed-up.
+The X5 gate on `tp_sharded` vs `sp_only`, two runs of the current method:
+
+| Point | Run 1 | Run 2 | Gate |
+|---|---|---|---|
+| K3 50k | +0.83% | +1.29% | +2.5% |
+| K3 512k | +1.06% | +1.16% | +1.5% |
+| K2.7 50k | +1.78% | +0.81% | +3.0% |
+| K2.7 256k | +1.61% | +2.01% | +2.5% |
+
 - **Where the overhead comes from:** the TP gather runs serially ahead of the expansion. That's about 0.1 ms at 50k
   (mostly fixed latency) and 0.3–0.6 ms at 256k–512k. Phase 3 (overlap) is what removes it.
-- **Measurement method:** an untimed warm-up replay, then the median of 5 replays 2 s apart; the middle three must
-  agree within 2%. Two things forced this:
-  1. **Back-to-back replays slow down under sustained load,** a steady climb (K3 512k: 61.7 → 70.5 ms over 7
-     replays).
-  2. **The first replay after a capture runs about 2% fast at 50k.**
-
-  Timing only the first replay, as the MoE perf gate does, or a median of consecutive replays, both give misleading
-  numbers here.
-- **50k noise:** run-to-run noise at 50k is about ±0.7 percentage points, so the 50k gates mainly catch regressions
-  at the 1 ms scale.
+- **Gate history:** the gates were first estimated (+1.5/+1.2/+2.0/+1.5%), then set from measurement. Earlier
+  samples taken with older methods (first replay only, or back-to-back medians) are not used.
+- **Why this method:** two effects made simpler methods misleading.
+  1. Back-to-back replays slow down under sustained load: K3 512k went 61.7 → 70.5 ms over 7 replays.
+  2. The first replay after a capture runs about 2% fast at 50k.
+- **Two kinds of numbers:**
+  - Traced numbers include the gaps between programs. Realtime-profiler numbers (the sum of kernel times, used by
+    `test_mla_chunked_perf_check` and for per-op breakdowns) don't. For example, K3 512k `sp_only` is 57.0 ms in the
+    profiler and 61.8 ms traced.
+  - Main's gap between the two is larger, so the speed-up over main is larger on the traced metric.
 
 ### DRAM (X6)
 
-Per chip, per user slot, measured allocation deltas at exact capacity:
+Per chip, per user slot, measured allocation deltas at whole-chunk capacities of 527360 rows (512k) and 266240 rows
+(256k), which are runnable dense `tp_shard_kv` layouts:
 
 | | Cache slot per layer, replicated → deduped | Shared TP latent slot | Net saving |
 |---|---|---|---|
@@ -109,7 +121,7 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
 ## Next steps
 
 1. **Review the last commit** (X9): Claude Code and Codex gpt-6-astra, per PLAN.md §0. Fix blockers and majors in a
-   reviewed follow-up. Re-run `test_mla_chunked_tp_sharded_traced_perf` with the 2% replay-agreement limit (X5).
+   reviewed follow-up.
 2. **CI (X8):** run the Blaze prefill legs on this branch, i.e. the PR's K2.7/K3 `tp_sharded` `maxedge` legs and the
    K2.7 transformer legs. Update `K3_CHUNKED_RT_PERF_NS`: `test_mla_chunked_perf_check` still has main's 10.556 ms
    target, while this branch measures ~7.66 ms on `sp_only`.

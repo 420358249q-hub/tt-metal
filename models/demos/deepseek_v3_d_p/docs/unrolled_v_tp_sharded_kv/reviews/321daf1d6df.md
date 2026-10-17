@@ -7,7 +7,7 @@ either. Fixes are in the follow-up commit.
 |---|---|---|---|---|
 | 1 | Bitwise cases can't detect a gather that misses older blocks: the shared slot still holds the previous chunk's (correct) data | Claude | major | Fixed: the bitwise test poisons the shared TP latent slot with finite garbage before every forward; the full scenario matrix (multi-user, padoverflow, rot-*, golden trace) is run |
 | 2 | Multi-layer slot selection and X4 (captured multi-layer multi-user trace) untested | both | major | X4 is covered by the PR's multi-layer `test_prefill_transformer_chunked` `tp_sharded` traced/notrace runs (layer-indexed slots, real captured trace) |
-| 3 | Traced replay output never checked; perf gate single-sample with no repeatability or power guard | both | major | Fixed: replay output must equal the eager output bitwise; two alternating runs per layout must agree within 1%; `is_high_power` guard |
+| 3 | Traced replay output never checked; perf gate single-sample with no repeatability or power guard | both | major | Fixed: replay output must equal the eager output bitwise; `is_high_power` guard. *(The two-run method was later replaced: see 25b664d628b.)* |
 | 4 | Bitwise matrix lacks CPU-reference / pretrained inputs | Codex | major | The golden-trace case uses pretrained K3 inputs; the PR's `tp_sharded` cpu/trace matrix gives PCC equal to sp_only for every case |
 | 5 | X6 (DRAM saving) has no test | both | minor | Fixed: `test_mla_tp_sharded_dram_saving` measures per-chip allocation deltas and scales to 24 / 61 MLA layers |
 | 6 | Slot allocated lazily inside the forward from a 1.2 GB fp32 host tensor | Claude | minor | Fixed: allocated in `set_tp_shard_kv` (outside any forward/capture), from bf16 host zeros |

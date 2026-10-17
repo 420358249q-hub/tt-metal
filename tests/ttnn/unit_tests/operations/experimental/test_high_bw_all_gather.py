@@ -2702,9 +2702,14 @@ def test_high_bw_all_gather_outer_blocks_validation(mesh_device, expect_error):
             outer_block_rows=_OUTER_BLOCK_ROWS,
             gathered_outer_blocks=1,
         )
-    # A bad block count on a program-cache HIT is still rejected.
+    # A bad block count on a program-cache HIT is still rejected: two valid counts share one program (so the third
+    # call is a hit, not a miss whose validation would raise the same message).
     gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=2)
     ttnn.synchronize_device(mesh_device)
+    entries = mesh_device.num_program_cache_entries()
+    gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=3)
+    ttnn.synchronize_device(mesh_device)
+    assert mesh_device.num_program_cache_entries() == entries, "a new block count must reuse the cached program"
     with expect_error(RuntimeError, "must be in"):
         gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=_OUTER_BLOCKS + 1)
     # In block mode the slab is only a unit: one that does not divide by the ring size is valid.
