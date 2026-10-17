@@ -1971,12 +1971,13 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
         mla_layer.set_tp_shard_kv(True)
     forward_all(cache_traced, tt_hidden)  # compile; rewrites step 0's rows with step 0's data, as the replay will
     ttnn.synchronize_device(mesh_device)
+    # Every program is compiled before the capture, and nothing compiles while the trace is alive (a new kernel binary
+    # could land on the trace's buffers). The live-buffer half of that rule is enforced only when run with
+    # TT_METAL_TRACE_ALLOC_TRACKING=1.
+    program_entries = mesh_device.num_program_cache_entries()
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     traced_outs = forward_all(cache_traced, tt_hidden)
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
-    # Nothing may compile while the trace is alive (a new kernel binary could land on the trace's buffers). The live-
-    # buffer half of that rule is enforced only when run with TT_METAL_TRACE_ALLOC_TRACKING=1.
-    program_entries = mesh_device.num_program_cache_entries()
 
     def replay(steps, poison_base):
         for step in steps:
@@ -2016,7 +2017,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                     f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
                     "output differ from the TP-replicated (sp_only) output"
                 )
-            # Allocated while the trace is alive: free before any replay (TT_METAL_TRACE_ALLOC_TRACKING=1 rejects live ones).
+            # Allocated while the trace is alive: free before any replay (allocation tracking rejects live ones).
             for out in outs:
                 ttnn.deallocate(out)
 

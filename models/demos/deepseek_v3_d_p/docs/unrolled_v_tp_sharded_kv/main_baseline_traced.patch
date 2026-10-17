@@ -1,5 +1,5 @@
 diff --git a/models/demos/deepseek_v3_d_p/tests/test_mla.py b/models/demos/deepseek_v3_d_p/tests/test_mla.py
-index 0413ec0296f..a6891f9167a 100644
+index 0413ec0296f..b750f3862b3 100644
 --- a/models/demos/deepseek_v3_d_p/tests/test_mla.py
 +++ b/models/demos/deepseek_v3_d_p/tests/test_mla.py
 @@ -9,6 +9,7 @@ tests/test_kv_cache_table.py and tests/sparse_mla/test_sparse_mla.py.
@@ -26,7 +26,7 @@ index 0413ec0296f..a6891f9167a 100644
      n_iters = max(len(u["group"]) for u in users)
      logger.info(f"Starting DEVICE chunked prefill: up to {n_iters} iters x {num_users} user(s)")
      for i in range(n_iters):
-@@ -851,6 +854,46 @@ def _run_chunked_prefill(
+@@ -851,6 +854,49 @@ def _run_chunked_prefill(
                      tt_out, fwd_ns = _rt_profile_forward_ns(mesh_device, _forward)
                      profiled_ns += fwd_ns
                      logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (realtime profiler)")
@@ -41,6 +41,9 @@ index 0413ec0296f..a6891f9167a 100644
 +                            mesh_device, dims=out_concat_dims, mesh_shape=mesh_device.shape
 +                        ),
 +                    )
++                    # Compile the in-place zeroing used on the replay's output below, so nothing compiles after capture.
++                    ttnn.mul(tt_out, 0.0, output_tensor=tt_out)
++                    ttnn.synchronize_device(mesh_device)
 +                    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
 +                    tt_replayed = _forward()
 +                    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
@@ -73,7 +76,7 @@ index 0413ec0296f..a6891f9167a 100644
                  else:
                      tt_out = _forward()
                  out_flat = ttnn.to_torch(
-@@ -896,6 +939,8 @@ def _run_chunked_prefill(
+@@ -896,6 +942,8 @@ def _run_chunked_prefill(
  
      if profile:
          return profiled_ns

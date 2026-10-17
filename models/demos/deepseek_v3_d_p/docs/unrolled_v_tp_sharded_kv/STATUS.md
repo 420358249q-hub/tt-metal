@@ -35,9 +35,10 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 | `06690863f87` | Round-4 review fixes: X4 cache_layer_idx + sp_only equality + rotated starts, cache-hit proof, traced main baseline, docs | [log](reviews/06690863f87.md) |
 | `5be86f27b90` | Round-5 review fixes: X4 cache comparison and layout alternation, gates, main-baseline patch, docs | [log](reviews/5be86f27b90.md) |
 | `42fc9f477b3` | Round-6 review fixes: X4 compiles before capture, eager tp_sharded after sp_only, outputs freed (passes with trace allocation tracking), slot-extent check; K3 512k gate 2.2%; baseline patch checks replay | [log](reviews/42fc9f477b3.md) |
-| *(last)* | Round-7 review fixes: no-compile assertion in X4, extent-check wording, baseline replay output zeroed first | **pending** (next step 1) |
+| `f99bc175844` | Round-7 review fixes: no-compile assertion in X4, extent-check wording, baseline replay output zeroed first | [log](reviews/f99bc175844.md) |
+| *(last)* | Round-8 review fixes: X4 program-cache snapshot taken before capture; baseline patch compiles its zeroing before capture (passes with allocation tracking) | **pending** (next step 1) |
 
-Each commit up to `42fc9f477b3` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
+Each commit up to `f99bc175844` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
 
 ## Exit criteria (PLAN.md §0)
@@ -91,7 +92,7 @@ The X5 gate on `tp_sharded` vs `sp_only`, two runs of the current method:
   things, and neither is a fixed offset from the other. Measured on this Galaxy: K3 50k `sp_only` is 7.54 ms traced
   vs 7.65 ms profiler; K3 512k `sp_only` 61.8 ms traced vs 57.0 ms profiler; main K3 50k 10.33 ms traced vs 10.42 ms
   profiler; main K3 512k 89.6 ms traced vs 79.7 ms profiler. Compare only within one metric.
-- **Main's numbers repeat:** a second run of main's baseline, with its replay checked against eager, gave 10.298 / 89.487 / 6.816 / 29.455 ms, within 0.3% of the table.
+- **Main's numbers repeat:** a second run of main's baseline, with its replay checked against eager, gave 10.298 / 89.487 / 6.816 / 29.455 ms, within 0.3% of the table. A third, with `TT_METAL_TRACE_ALLOC_TRACKING=1`, gave 10.341 / 89.584 / 6.854 / 29.452 ms.
 - **Reproducing main's numbers:** apply [main_baseline_traced.patch](main_baseline_traced.patch) to a main worktree at
   `a7a3bc8f603`. It adds the same `trace_time` mode to main's `test_mla.py`, plus `test_mla_traced_baseline_scratch.py`
   for the four points. Then run that test the same way as above.
