@@ -1,0 +1,114 @@
+diff --git a/models/demos/deepseek_v3_d_p/tests/test_mla.py b/models/demos/deepseek_v3_d_p/tests/test_mla.py
+index 0413ec0296f..54cf229b486 100644
+--- a/models/demos/deepseek_v3_d_p/tests/test_mla.py
++++ b/models/demos/deepseek_v3_d_p/tests/test_mla.py
+@@ -9,6 +9,7 @@ tests/test_kv_cache_table.py and tests/sparse_mla/test_sparse_mla.py.
+ 
+ import math
+ import os
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -553,6 +554,7 @@ def _run_chunked_prefill(
+     use_metadata_tensor=False,
+     determinism_check=False,
+     profile=False,
++    trace_time=False,
+     tight_cache=False,
+ ):
+     """Unified chunked-prefill scenario, decoupled from the reference.
+@@ -767,6 +769,7 @@ def _run_chunked_prefill(
+     # ---- iterate: interleave users by local iter index (exercises cross-user isolation) ----
+     det_failures = []
+     profiled_ns = 0.0
++    traced_ns = 0.0
+     n_iters = max(len(u["group"]) for u in users)
+     logger.info(f"Starting DEVICE chunked prefill: up to {n_iters} iters x {num_users} user(s)")
+     for i in range(n_iters):
+@@ -851,6 +854,31 @@ def _run_chunked_prefill(
+                     tt_out, fwd_ns = _rt_profile_forward_ns(mesh_device, _forward)
+                     profiled_ns += fwd_ns
+                     logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (realtime profiler)")
++                elif trace_time:
++                    # Same method as the unrolled-V branch's trace_time: eager compile, capture, one untimed warm-up
++                    # replay, then the median of 5 replays 2 s apart (middle three within 2%).
++                    tt_out = _forward()
++                    ttnn.synchronize_device(mesh_device)
++                    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
++                    _forward()
++                    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
++                    ttnn.synchronize_device(mesh_device)
++                    ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
++                    ttnn.synchronize_device(mesh_device)
++                    replay_ns = []
++                    for _ in range(5):
++                        time.sleep(2)
++                        start_ns = time.perf_counter_ns()
++                        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
++                        ttnn.synchronize_device(mesh_device)
++                        replay_ns.append(time.perf_counter_ns() - start_ns)
++                    middle = sorted(replay_ns)[1:-1]
++                    spread = middle[-1] / middle[0] - 1
++                    assert spread <= 0.02, f"traced replays disagree by {spread * 100:.2f}%: {replay_ns}"
++                    fwd_ns = middle[len(middle) // 2]
++                    ttnn.release_trace(mesh_device, tid)
++                    traced_ns += fwd_ns
++                    logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (traced replay) {replay_ns}")
+                 else:
+                     tt_out = _forward()
+                 out_flat = ttnn.to_torch(
+@@ -896,6 +924,8 @@ def _run_chunked_prefill(
+ 
+     if profile:
+         return profiled_ns
++    if trace_time:
++        return traced_ns
+ 
+     if determinism_check:
+         if det_failures:
+diff --git a/models/demos/deepseek_v3_d_p/tests/test_mla_traced_baseline_scratch.py b/models/demos/deepseek_v3_d_p/tests/test_mla_traced_baseline_scratch.py
+new file mode 100644
+index 00000000000..9f571b1bf2a
+--- /dev/null
++++ b/models/demos/deepseek_v3_d_p/tests/test_mla_traced_baseline_scratch.py
+@@ -0,0 +1,39 @@
++# Scratch (untracked, baseline worktree only): main's ring_mla MLA forward timed as a traced replay, for comparison
++# with the unrolled-V branch's test_mla_chunked_tp_sharded_traced_perf.
++import pytest
++from loguru import logger
++
++from models.demos.deepseek_v3_d_p.tests.test_mla import _run_chunked_prefill, torus_xy_device_params
++from models.demos.deepseek_v3_d_p.tt.tt_ccl import per_axis_topology
++
++
++@pytest.mark.parametrize(
++    "mesh_device,device_params",
++    [
++        pytest.param(
++            (8, 4),
++            torus_xy_device_params(l1_small_size=1152, trace_region_size=64 * 1024 * 1024),
++            id="torus-xy-8x4",
++        )
++    ],
++    indirect=["mesh_device", "device_params"],
++)
++@pytest.mark.parametrize(
++    "variant,prefill_len",
++    [("kimi_k3", 50 * 1024), ("kimi_k3", 512 * 1024), ("kimi_k2_7", 50 * 1024), ("kimi_k2_7", 256 * 1024)],
++    ids=["k3-50k", "k3-512k", "k2_7-50k", "k2_7-256k"],
++    indirect=["variant"],
++)
++@pytest.mark.timeout(0)
++def test_main_traced_baseline(request, mesh_device, device_params, variant, prefill_len):
++    ns = _run_chunked_prefill(
++        request,
++        mesh_device,
++        reference=None,
++        topology=per_axis_topology(device_params["fabric_config"]),
++        iters_isl=[5120],
++        prefill_len=prefill_len,
++        use_metadata_tensor=True,
++        trace_time=True,
++    )
++    logger.info(f"RESULT main {variant.name} {prefill_len} + 5120 traced forward: {ns / 1e6:.3f} ms")

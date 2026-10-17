@@ -2707,6 +2707,7 @@ def test_high_bw_all_gather_outer_blocks_validation(mesh_device, expect_error):
     gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=2)
     ttnn.synchronize_device(mesh_device)
     entries = mesh_device.num_program_cache_entries()
+    assert entries > 0, "the program cache must be on for the cache-hit check to mean anything"
     gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=3)
     ttnn.synchronize_device(mesh_device)
     assert mesh_device.num_program_cache_entries() == entries, "a new block count must reuse the cached program"

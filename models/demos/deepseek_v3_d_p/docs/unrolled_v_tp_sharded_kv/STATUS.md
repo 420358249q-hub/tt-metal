@@ -8,8 +8,8 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 
 **Starting point**
 - **Unrolled-V** (branch `pjosipovic/ring-joint-sdpa-unrolled-v-mcast`, commit `7d302b0c4e1`): expands V per head
-  ahead of `ring_joint` SDPA. Measured as traced replays, K3 MLA forward is 27–31% faster than main's `ring_mla` and
-  K2.7 20–25% faster (table below).
+  ahead of `ring_joint` SDPA. On this branch, measured as traced replays with the TP-replicated cache (`sp_only`), K3
+  MLA forward is 27–31% faster than main's `ring_mla` and K2.7 20–25% faster (table below).
 - **PR #59531** shards the dense KV cache over SP×TP: each chip keeps 1/32 of the cache instead of 1/8, so 4× less KV
   DRAM. As written, the two features clash: a chip can expand V only for rows it holds, and with the sharded cache
   3 of every 4 rows of its SP slab sit on TP neighbours.
@@ -32,9 +32,10 @@ Milestone: Phase 2 of [PLAN.md](PLAN.md) (serial TP latent gather, no overlap). 
 | `745a37d83fa` | Op review fixes: page-unit outer count (fixes a width-gather overrun), min-pages guard, tests | [log](reviews/745a37d83fa.md) |
 | `00ef3010018` | MLA review fixes: slot allocated at init, poisoned bitwise test, DRAM test | [log](reviews/00ef3010018.md) |
 | `25b664d628b` | Round-3 review fixes: X4 trace-replay test, replay poisoning, perf method and gates, op tests; docs | [log](reviews/25b664d628b.md) |
-| *(last)* | Round-4 review fixes: X4 cache_layer_idx + sp_only equality + rotated starts, cache-hit proof, traced main baseline, docs | **pending** (next step 1) |
+| `06690863f87` | Round-4 review fixes: X4 cache_layer_idx + sp_only equality + rotated starts, cache-hit proof, traced main baseline, docs | [log](reviews/06690863f87.md) |
+| *(last)* | Round-5 review fixes: X4 cache comparison and layout alternation, gates, main-baseline patch, docs | **pending** (next step 1) |
 
-Each commit up to `25b664d628b` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
+Each commit up to `06690863f87` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
 
 ## Exit criteria (PLAN.md §0)
@@ -44,11 +45,11 @@ answered in its log.
 | X1 | `tp_shard_kv` runs unrolled-V, no `ring_mla` | ✅ | `_chunked_attn` / `_tp_gather_latent` |
 | X2 | `tp_sharded` bitwise equal to `sp_only` | ✅ | `test_mla_chunked_prefill_tp_sharded_matches_sp_only`: 58 passed on functional + golden inputs, plus 44 passed on CPU-reference inputs, with the shared slot poisoned before every forward. Exclusions: no K2.7 golden trace exists (2 skips), and the deep/production scenarios have no CPU-reference case (CPU MLA too slow); both run on functional inputs. The PR's `test_mla_chunked_prefill` `tp_sharded` matrix: 140 passed, 0 failed. |
 | X3 | No regressions | ✅ | 53 Galaxy MLA tests pass on `sp_only`, with PCCs identical to before the merge. K3 KDA carry (`kimi_k3/test_chunked_prefill.py`): 4/4. |
-| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
-| X5 | Traced perf gate | ✅ | Two runs of the current method, 4/4 points each (below). Gates were set from measurement, replacing the pre-measurement estimates. |
+| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts on a chip boundary), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise, for both the outputs and the un-striped caches, with every (user, layer) slot written. The capture stays alive through the `sp_only` pass and is replayed again afterwards on `tp_sharded` (layouts alternate). Mid-chip rotated starts are covered by the single-layer X2 scenarios. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced. |
+| X5 | Traced perf gate | ✅ | Two runs of the current method, 4/4 points each (below). Gates are the worst measured sample plus about 1 pp of measured noise, replacing the pre-measurement estimates. |
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities (see below) |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
-| X8 | Defaults and CI | ◐ | `sp_only` K3 50k realtime-profiler time unchanged: 7.654 / 7.660 ms vs 7.656 ms before. **CI legs not run** (next step 2, deliberately out of this milestone). |
+| X8 | Defaults and CI | ◐ | `sp_only` K3 50k is unchanged on the realtime profiler (7.654 / 7.660 ms vs 7.656 ms before). The criterion asks for a traced before/after, which was not measured: only the branch's traced `sp_only` (table below). **CI legs not run** (next step 2, deliberately out of this milestone). |
 | X9 | Two reviews per commit | ◐ | Done for all commits except the last (next step 1) |
 
 ### Performance (X5)
@@ -56,6 +57,8 @@ answered in its log.
 All numbers are **traced replays** of one 5k-chunk MLA forward on the same Galaxy: an untimed warm-up replay, then
 the median of 5 replays 2 s apart (the middle three must agree within 2%). Main's `ring_mla` was timed the same way in
 a main worktree (merge-base `a7a3bc8f603`).
+
+Absolute times from run 1:
 
 | Point | main `ring_mla` | unrolled-V `sp_only` | unrolled-V `tp_sharded` | Speed-up kept with the sharded cache |
 |---|---|---|---|---|
@@ -69,22 +72,26 @@ The X5 gate on `tp_sharded` vs `sp_only`, two runs of the current method:
 | Point | Run 1 | Run 2 | Gate |
 |---|---|---|---|
 | K3 50k | +0.83% | +1.29% | +2.5% |
-| K3 512k | +1.06% | +1.16% | +1.5% |
+| K3 512k | +1.06% | +1.16% | +2.0% |
 | K2.7 50k | +1.78% | +0.81% | +3.0% |
-| K2.7 256k | +1.61% | +2.01% | +2.5% |
+| K2.7 256k | +1.61% | +2.01% | +3.0% |
 
 - **Where the overhead comes from:** the TP gather runs serially ahead of the expansion. That's about 0.1 ms at 50k
   (mostly fixed latency) and 0.3–0.6 ms at 256k–512k. Phase 3 (overlap) is what removes it.
-- **Gate history:** the gates were first estimated (+1.5/+1.2/+2.0/+1.5%), then set from measurement. Earlier
-  samples taken with older methods (first replay only, or back-to-back medians) are not used.
+- **Gate history:** the gates were first estimated (+1.5/+1.2/+2.0/+1.5%). They are now the worst current-method
+  sample plus about 1 pp, since run-to-run noise in the overhead is about ±0.5 pp at 50k and up to 0.4 pp at
+  256k–512k. Earlier samples taken with older methods (first replay only, or back-to-back medians) are not used.
 - **Why this method:** two effects made simpler methods misleading.
   1. Back-to-back replays slow down under sustained load: K3 512k went 61.7 → 70.5 ms over 7 replays.
   2. The first replay after a capture runs about 2% fast at 50k.
-- **Two kinds of numbers:**
-  - Traced numbers include the gaps between programs. Realtime-profiler numbers (the sum of kernel times, used by
-    `test_mla_chunked_perf_check` and for per-op breakdowns) don't. For example, K3 512k `sp_only` is 57.0 ms in the
-    profiler and 61.8 ms traced.
-  - Main's gap between the two is larger, so the speed-up over main is larger on the traced metric.
+- **Two kinds of numbers:** traced replays (host wall-clock, above) and the realtime profiler (the sum of per-program
+  kernel times at the slowest chip, used by `test_mla_chunked_perf_check` and for per-op breakdowns) measure different
+  things, and neither is a fixed offset from the other. Measured on this Galaxy: K3 50k `sp_only` is 7.54 ms traced
+  vs 7.65 ms profiler; K3 512k `sp_only` 61.8 ms traced vs 57.0 ms profiler; main K3 50k 10.33 ms traced vs 10.42 ms
+  profiler; main K3 512k 89.6 ms traced vs 79.7 ms profiler. Compare only within one metric.
+- **Reproducing main's numbers:** apply [main_baseline_traced.patch](main_baseline_traced.patch) to a main worktree at
+  `a7a3bc8f603`. It adds the same `trace_time` mode to main's `test_mla.py`, plus `test_mla_traced_baseline_scratch.py`
+  for the four points. Then run that test the same way as above.
 
 ### DRAM (X6)
 

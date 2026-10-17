@@ -1691,13 +1691,14 @@ def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
 
 # G3 gates for the TP-sharded cache (docs/unrolled_v_tp_sharded_kv/PLAN.md X5): traced forward overhead vs sp_only, with
 # the TP latent gather serial ahead of the expansion (~0.1 ms at 50k, mostly fixed latency; 0.3-0.6 ms at 256k-512k).
-# Set from two runs of this method on a Galaxy 8x4 (2026-10-17): K3 50k +0.83/+1.29%, K3 512k +1.06/+1.16%, K2.7 50k
-# +1.78/+0.81%, K2.7 256k +1.61/+2.01%, with margin for the run-to-run noise (about +-0.5 pp at 50k).
+# Two runs of this method on a Galaxy 8x4 (2026-10-17) measured K3 50k +0.83/+1.29%, K3 512k +1.06/+1.16%, K2.7 50k
+# +1.78/+0.81%, K2.7 256k +1.61/+2.01%. Run-to-run noise in the overhead is about +-0.5 pp at 50k and up to 0.4 pp at
+# 256k-512k, so each gate is the worst sample plus about 1 pp.
 _TP_SHARDED_PERF_POINTS = [
     pytest.param("kimi_k3", 50 * 1024, 0.025, id="k3-50k"),
-    pytest.param("kimi_k3", 512 * 1024, 0.015, id="k3-512k"),
+    pytest.param("kimi_k3", 512 * 1024, 0.020, id="k3-512k"),
     pytest.param("kimi_k2_7", 50 * 1024, 0.030, id="k2_7-50k"),
-    pytest.param("kimi_k2_7", 256 * 1024, 0.025, id="k2_7-256k"),
+    pytest.param("kimi_k2_7", 256 * 1024, 0.030, id="k2_7-256k"),
 ]
 
 
@@ -1956,6 +1957,9 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
 
     # Traced: one capture, replayed once per step with the inputs and metadata rewritten in place.
     cache_traced = new_cache()
+    # Allocated before the capture: anything persistent allocated while the trace is alive could land on the trace's
+    # intermediate buffers and be overwritten by a later replay.
+    cache_sp = new_cache(tp_sharded=False)
     tt_hidden = [to_device(host_hidden(0, layer)) for layer in range(num_layers)]
     set_step(*_X4_STEPS[0])
     forward_all(cache_traced, tt_hidden)  # compile; rewrites step 0's rows with step 0's data, as the replay will
@@ -1963,8 +1967,10 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     traced_outs = forward_all(cache_traced, tt_hidden)
     ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
-    try:
-        for step, (user, start) in enumerate(_X4_STEPS):
+
+    def replay(steps, poison_base):
+        for step in steps:
+            user, start = _X4_STEPS[step]
             set_step(user, start)
             for layer in range(num_layers):
                 ttnn.copy_host_to_device_tensor(
@@ -1973,7 +1979,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                     ),
                     tt_hidden[layer],
                 )
-            poison(100 + step)
+            poison(poison_base + step)
             ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
             for layer in range(num_layers):
                 got = ttnn.to_torch(traced_outs[layer], mesh_composer=composer)
@@ -1982,24 +1988,50 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                     f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the traced "
                     "replay differ from the eager forward"
                 )
+
+    try:
+        replay(range(len(_X4_STEPS)), poison_base=100)
+
+        # The same steps eagerly on the TP-replicated cache: the TP-sharded layer and cache indexing must give the same
+        # output.
+        for mla_layer in layers:
+            mla_layer.set_tp_shard_kv(False)
+        for step, (user, start) in enumerate(_X4_STEPS):
+            set_step(user, start)
+            outs = forward_all(cache_sp, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
+            for layer in range(num_layers):
+                got = ttnn.to_torch(outs[layer], mesh_composer=composer)
+                mismatched = (got != eager[step][layer]).sum().item()
+                assert mismatched == 0, (
+                    f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
+                    "output differ from the TP-replicated (sp_only) output"
+                )
+
+        # Back to TP-sharded after the replicated forwards: replaying the same capture must still match (nothing the
+        # sp_only calls touched may leave shared buffers or cached runtime arguments wrong for the sharded path).
+        for mla_layer in layers:
+            mla_layer.set_tp_shard_kv(True)
+        replay(range(len(_X4_STEPS)), poison_base=200)
     finally:
         ttnn.release_trace(mesh_device, tid)
 
-    # The same steps eagerly on the TP-replicated cache: the TP-sharded layer and cache indexing must give the same output.
-    for mla_layer in layers:
-        mla_layer.set_tp_shard_kv(False)
-    cache_sp = new_cache(tp_sharded=False)
-    for step, (user, start) in enumerate(_X4_STEPS):
-        set_step(user, start)
-        outs = forward_all(cache_sp, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
+    # The caches themselves, un-striped to natural order: the traced, TP-sharded eager and TP-replicated eager runs must
+    # have written identical bytes into every (user, layer) slot, and every slot must hold data. Equal outputs alone
+    # would miss a cache write that ignores the layer, since every layout would read the same wrong slot.
+    def natural(cache, tp_sharded):
+        flat, stripes = gather_cache_natural(cache.storage, mesh_device, tp_sharded)
+        nat = torch.empty_like(flat)
+        nat[:, blockcyclic_positions(stripes, chunk, seq_len_cache)] = flat
+        return nat
+
+    nat_eager, nat_traced, nat_sp = natural(cache_eager, True), natural(cache_traced, True), natural(cache_sp, False)
+    assert torch.equal(nat_traced, nat_eager), "traced and eager TP-sharded caches differ"
+    assert torch.equal(nat_sp, nat_eager), "TP-replicated and TP-sharded caches differ"
+    for user in range(num_users):
         for layer in range(num_layers):
-            got = ttnn.to_torch(outs[layer], mesh_composer=composer)
-            mismatched = (got != eager[step][layer]).sum().item()
-            assert mismatched == 0, (
-                f"step {step} (user {user}, start {start}) layer {layer}: {mismatched} elements of the TP-sharded "
-                "output differ from the TP-replicated (sp_only) output"
-            )
+            slot = user * num_layers + layer
+            assert nat_eager[slot].abs().sum() > 0, f"cache slot of user {user} layer {layer} was never written"
     logger.success(
-        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), bitwise, over {len(_X4_STEPS)} steps x "
-        f"{num_layers} layers"
+        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(_X4_STEPS)} "
+        f"steps x {num_layers} layers, replayed again after the sp_only pass"
     )
