@@ -118,6 +118,10 @@ ttsl::hash::hash_t HighBwAllGatherDeviceOperation::compute_program_hash(
         args.ready_semaphore.has_value(),
         args.input_batch_index.has_value(),
         args.gathered_dim_size.has_value(),
+        // The outer-block mode changes the reader's compile-time extent geometry, so it is hashed; the scalar
+        // live-block count is a runtime value like gathered_dim_size, so only its presence is.
+        args.outer_block_rows,
+        args.gathered_outer_blocks.has_value(),
         // Slot select via metadata changes the reader binary (it reads the page base on-device instead of
         // taking it as a runtime argument), so the PRESENCE is hashed. The value is not: it lives in a
         // tensor the kernel reads each dispatch, which is the whole point.
@@ -231,6 +235,47 @@ void validate_gathered_prefix_metadata(const HighBwAllGatherParams& args, const 
 }
 
 void validate_slot_extent_control_mix(const HighBwAllGatherParams& args, const HighBwAllGatherInputs& tensor_args) {
+    if (args.gathered_outer_blocks.has_value() || args.outer_block_rows > 0) {
+        TT_FATAL(
+            args.outer_block_rows > 0,
+            "high_bw_all_gather gathered_outer_blocks requires outer_block_rows > 0 (it counts outer blocks)");
+        TT_FATAL(
+            !args.gathered_dim_size.has_value(),
+            "high_bw_all_gather outer_block_rows bounds whole blocks; it cannot be combined with the row extent "
+            "gathered_dim_size");
+        TT_FATAL(
+            !(args.gathered_outer_blocks.has_value() && tensor_args.has_gathered_prefix_metadata()),
+            "high_bw_all_gather gathered_outer_blocks and gathered_prefix_tensor are mutually exclusive -- pass the "
+            "scalar block count OR the start-position tensor (the trace-safe form)");
+        const auto& shape = tensor_args.input_tensor.padded_shape();
+        const int32_t rank = static_cast<int32_t>(shape.rank());
+        const int32_t gather_dim = args.dim < 0 ? args.dim + rank : args.dim;
+        TT_FATAL(
+            gather_dim >= 1 && shape[gather_dim] % args.outer_block_rows == 0,
+            "high_bw_all_gather outer_block_rows {} must divide the gather dim {} (dim {})",
+            args.outer_block_rows,
+            shape[gather_dim],
+            gather_dim);
+        if (tensor_args.input_tensor.layout() == Layout::TILE) {
+            const uint32_t tile_h = tensor_args.input_tensor.tensor_spec().tile().get_height();
+            TT_FATAL(
+                gather_dim == rank - 2 && args.outer_block_rows % tile_h == 0,
+                "high_bw_all_gather outer_block_rows {} must be a whole number of tile rows ({}) on the row dim",
+                args.outer_block_rows,
+                tile_h);
+        }
+        uint32_t outer_count = shape[gather_dim] / args.outer_block_rows;
+        for (int32_t i = 1; i < gather_dim; ++i) {
+            outer_count *= shape[i];
+        }
+        if (args.gathered_outer_blocks.has_value()) {
+            TT_FATAL(
+                *args.gathered_outer_blocks > 0 && *args.gathered_outer_blocks <= outer_count,
+                "high_bw_all_gather gathered_outer_blocks {} must be in (0, {}]",
+                *args.gathered_outer_blocks,
+                outer_count);
+        }
+    }
     if (!tensor_args.has_gathered_prefix_metadata()) {
         return;
     }
@@ -361,9 +406,12 @@ void HighBwAllGatherDeviceOperation::validate_on_program_cache_miss(
                 output_shape[0] == 1,
                 "high_bw_all_gather selected-batch output must have batch 1, got {}",
                 output_shape[0]);
-            // The selected cache-slot path intentionally addresses one contiguous [1, ...] tensor.
-            // Supporting arbitrary leading dimensions would make the selected page range discontinuous.
-            for (int32_t i = 1; i < args.dim; ++i) {
+            // One selected slot is always a contiguous page range (dim 0 is outermost). Outer dims between
+            // batch and dim are fine for a whole-slot or outer-block extent: the output interleaves the ranks
+            // per outer block. Only a ROW extent needs them singleton, since it bounds a strided page subset.
+            const bool row_extent = args.outer_block_rows == 0 &&
+                                    (args.gathered_dim_size.has_value() || tensor_args.has_gathered_prefix_metadata());
+            for (int32_t i = 1; row_extent && i < args.dim; ++i) {
                 TT_FATAL(
                     input_padded_shape[i] == 1 && output_shape[i] == 1,
                     "high_bw_all_gather selected-batch path requires singleton dimensions between batch and dim; "
@@ -493,7 +541,9 @@ std::tuple<HighBwAllGatherParams, HighBwAllGatherInputs> high_bw_all_gather_buil
     const std::optional<Tensor>& gathered_prefix_tensor,
     uint32_t gathered_slab_global,
     const std::optional<GlobalSemaphore>& ready_semaphore,
-    const std::optional<GlobalSemaphore>& data_valid_semaphore) {
+    const std::optional<GlobalSemaphore>& data_valid_semaphore,
+    uint32_t outer_block_rows,
+    std::optional<uint32_t> gathered_outer_blocks) {
     // Query the machine and Fabric setup info.
     // This info is also effectively part of CCL args and hence should be in the program-cache hash,
     // so we include it in HighBwAllGatherParams.
@@ -594,7 +644,9 @@ std::tuple<HighBwAllGatherParams, HighBwAllGatherInputs> high_bw_all_gather_buil
             .gathered_dim_size = gathered_dim_size,
             .batch_slot_num_layers = batch_slot_num_layers,
             .batch_slot_layer_idx = batch_slot_layer_idx,
-            .gathered_slab_global = gathered_slab_global},
+            .gathered_slab_global = gathered_slab_global,
+            .outer_block_rows = outer_block_rows,
+            .gathered_outer_blocks = gathered_outer_blocks},
         HighBwAllGatherInputs{
             .input_tensor = input_tensor,
             .output_tensor = output_tensor,
@@ -622,7 +674,9 @@ Tensor high_bw_all_gather(
     const std::optional<Tensor>& gathered_prefix_tensor,
     uint32_t gathered_slab_global,
     const std::optional<GlobalSemaphore>& ready_semaphore,
-    const std::optional<GlobalSemaphore>& data_valid_semaphore) {
+    const std::optional<GlobalSemaphore>& data_valid_semaphore,
+    uint32_t outer_block_rows,
+    std::optional<uint32_t> gathered_outer_blocks) {
     auto [params, inputs] = ttnn::operations::experimental::high_bw_all_gather::high_bw_all_gather_build_operation_args(
         input_tensor,
         output_tensor,
@@ -639,7 +693,9 @@ Tensor high_bw_all_gather(
         gathered_prefix_tensor,
         gathered_slab_global,
         ready_semaphore,
-        data_valid_semaphore);
+        data_valid_semaphore,
+        outer_block_rows,
+        gathered_outer_blocks);
     return ttnn::device_operation::launch<
         ttnn::operations::experimental::high_bw_all_gather::HighBwAllGatherDeviceOperation>(params, inputs);
 }
