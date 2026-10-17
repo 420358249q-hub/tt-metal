@@ -1000,8 +1000,6 @@ class ttMLA:
 
         # Write this chunk into the cache. update_padded_kv_cache derives each chip's local write
         # offset on-device from kv_actual_global (chunk-aligned kv_actual -> uniform per-chip write).
-        # The dense chunked cache is still TP-replicated; only _sparse_chunked_attn is TP-dedup wired.
-        assert not self.tp_shard_kv, "tp_shard_kv is only supported on the sparse (DSA) path, not dense chunked"
         # Metadata (trace-safe) path reads slot_idx/kv_actual_global on-device from the metadata tensor.
         self._update_kv_cache(
             kvpe_cache,
@@ -1043,9 +1041,26 @@ class ttMLA:
             # Capped at the capacity the SDPA accepts: the last chunk's pad rows can sit past the cache
             # end, and only pad rows read them.
             ring_logical_n = min(kv_actual_isl + chunk_size_global, cache_rows_global)
+        kv_storage = kvpe_cache.storage
+        if self.tp_shard_kv:
+            # The cache holds 1/tp of this SP row's latent. Rebuild the row's latent (the TP-replicated layout) in a
+            # shared single-slot buffer, then run unrolled-V on that as a one-slot cache.
+            kv_storage = self._tp_gather_latent(
+                kvpe_cache, cache_batch_idx, cache_layer_idx, kv_actual_isl, seq_len_local, metadata
+            )
+            if metadata is not None:
+                meta_slot_kwargs = {
+                    "slot_id": self.tt_ccl.get_zero_slot_tensor(),
+                    "kv_actual_isl_tensor": metadata[1],
+                    "kv_cache_num_layers": 1,
+                    "kv_cache_layer_idx": 0,
+                }
+            else:
+                meta_slot_kwargs = {"kv_cache_batch_idx": 0, "kv_actual_isl": kv_actual_isl}
         return self._unrolled_v_attn(
             tt_q=tt_q,
-            kvpe_cache=kvpe_cache,
+            kv_storage=kv_storage,
+            single_slot=self.tp_shard_kv,
             ring_logical_n=ring_logical_n,
             seq_len_local=seq_len_local,
             cache_batch_idx=cache_batch_idx,
@@ -1053,6 +1068,56 @@ class ttMLA:
             metadata=metadata,
             meta_slot_kwargs=meta_slot_kwargs,
         )
+
+    def _tp_gather_latent(self, kvpe_cache, cache_batch_idx, cache_layer_idx, kv_actual_isl, seq_len_local, metadata):
+        """Gather this user/layer's slot of the TP-deduped latent cache over TP into the shared single-slot buffer.
+
+        The deduped cache holds, per chunk c, this chip's region t of the SP slab: local rows [c*region, (c+1)*region),
+        region = seq_len_local / tp. Gathering over TP in blocks of one region interleaves the ranks per chunk, which is
+        the TP-replicated layout: global row c*chunk + s*seq_len_local + t*region + r at
+        local row c*seq_len_local + t*region + r. Only the chunks up to and including this one are moved. Runs after the
+        cache write, and before the expansion and the SDPA, which both read the buffer."""
+        storage = kvpe_cache.storage
+        _, _, rows_dedup, kvpe_dim = storage.shape
+        region = seq_len_local // self.tp_factor
+        nblk = rows_dedup // region
+        assert (
+            region % ttnn.TILE_SIZE == 0 and rows_dedup % region == 0
+        ), f"TP latent gather needs whole tile-aligned regions: {rows_dedup} cache rows, region {region}"
+        chunk_size_global = seq_len_local * self.sp_factor
+        slot_buf = self.tt_ccl.get_mla_tp_latent_slot(
+            seq_len=rows_dedup * self.tp_factor * self.sp_factor,
+            kvpe_dim=kvpe_dim,
+            sp_axis=self.sp_axis,
+            tp_axis=self.tp_axis,
+        )
+        if metadata is not None:
+            # metadata[1] is this chunk's global start; one chunk (5120 tokens) is one block, so the op's
+            # min(round_up(start + chunk, chunk), nblk * chunk) / chunk is the live block count, rotated starts included.
+            extent = {
+                "input_batch_index_tensor": metadata[0],
+                "batch_slot_num_layers": self.layer_num,
+                "batch_slot_layer_idx": cache_layer_idx,
+                "gathered_prefix_tensor": metadata[1],
+                "gathered_slab_global": chunk_size_global,
+            }
+        else:
+            extent = {
+                "input_batch_index": cache_batch_idx,
+                "gathered_outer_blocks": min(-(-(kv_actual_isl + chunk_size_global) // chunk_size_global), nblk),
+            }
+        # Gathered in blocks of one region: each chunk's 4 TP regions land side by side, no reshape (the cache is
+        # ND-sharded, so a reshape would copy it).
+        ttnn.experimental.high_bw_all_gather(
+            storage,
+            2,
+            slot_buf,
+            cluster_axis=self.tp_axis,
+            num_links=self.ccl_num_links,
+            outer_block_rows=region,
+            **extent,
+        )
+        return slot_buf
 
     # V expansion (minimal_matmul), swept on Blackhole (HiFi2, 2k-262k local rows, i.e. short to 512k KV): the whole
     # latent K in one block (packed straight to the output), hardware multicast of the input blocks and M along the
@@ -1178,25 +1243,34 @@ class ttMLA:
         )
 
     def _expand_v(
-        self, kvpe_cache, ring_logical_n, seq_len_local, cache_batch_idx, cache_layer_idx, metadata, row_align
+        self,
+        kv_storage,
+        ring_logical_n,
+        seq_len_local,
+        cache_batch_idx,
+        cache_layer_idx,
+        metadata,
+        row_align,
+        single_slot=False,
     ):
         """V = latent @ W_UV over the filled local cache rows, written head-major [1, H_local, cap_local, v_head_dim].
         Rows are rounded up to row_align, the SDPA's K chunk: the SDPA reads whole K/V chunks and masks the tail, so
         every row it reads must hold finite data (0 * NaN from an unwritten row would poison the output)."""
-        cap_local = kvpe_cache.storage.shape[2]
+        cap_local = kv_storage.shape[2]
         chunk_size_global = seq_len_local * self.sp_factor
         if metadata is not None:
             # metadata[1] is the global prefix length; each chunk (even a partial one) adds seq_len_local rows to
             # every device's cache, so local rows = ceil(prefix / chunk_global) * seq_len_local + seq_len_local.
+            # A single-slot source (the TP-gathered latent) has no user or layer to select.
             rows = ttnn.MinimalMatmulDynamicRows(
                 metadata[1],
-                slot_tensor=metadata[0],
+                slot_tensor=None if single_slot else metadata[0],
                 divisor=chunk_size_global,
                 multiplier=seq_len_local,
                 addend=seq_len_local,
                 align=row_align,
-                num_layers=self.layer_num,
-                layer_idx=cache_layer_idx,
+                num_layers=1 if single_slot else self.layer_num,
+                layer_idx=0 if single_slot else cache_layer_idx,
             )
         else:
             local_rows = -(-ring_logical_n // chunk_size_global) * seq_len_local
@@ -1213,10 +1287,10 @@ class ttMLA:
             # No slot tensor: cache_batch_idx already folds (user, layer), so it is the layer index of a cache whose
             # every batch is a layer.
             rows = ttnn.MinimalMatmulDynamicRows(
-                self._expand_v_rows, num_layers=kvpe_cache.storage.shape[0], layer_idx=cache_batch_idx
+                self._expand_v_rows, num_layers=kv_storage.shape[0], layer_idx=0 if single_slot else cache_batch_idx
             )
         return ttnn.experimental.minimal_matmul(
-            kvpe_cache.storage,
+            kv_storage,
             self.wv_unrolled_weight,
             config=self._expand_v_config,
             compute_kernel_config=self._expand_v_compute_config,
@@ -1231,7 +1305,8 @@ class ttMLA:
         self,
         *,
         tt_q,
-        kvpe_cache,
+        kv_storage,
+        single_slot,
         ring_logical_n,
         seq_len_local,
         cache_batch_idx,
@@ -1241,11 +1316,18 @@ class ttMLA:
     ):
         q_chunk, k_chunk, k_splits = self._unrolled_v_sdpa_chunks(seq_len_local, tt_q.shape[1])
         tt_v = self._expand_v(
-            kvpe_cache, ring_logical_n, seq_len_local, cache_batch_idx, cache_layer_idx, metadata, row_align=k_chunk
+            kv_storage,
+            ring_logical_n,
+            seq_len_local,
+            cache_batch_idx,
+            cache_layer_idx,
+            metadata,
+            row_align=k_chunk,
+            single_slot=single_slot,
         )
         attn_out, _, _ = ttnn.transformer.ring_joint_scaled_dot_product_attention(
             tt_q,
-            kvpe_cache.storage,
+            kv_storage,
             tt_v,
             persistent_output_buffer_k=self._chunked_kv_buf,
             persistent_output_buffer_v=self._chunked_v_buf,
@@ -2235,31 +2317,18 @@ class ttMLA:
     # only sparse-specific gather/attention helpers live below.
     # ----------------------------------------------------------------------------------------
 
-    def _declare_q_sequence_topology(self, tt_q: ttnn.Tensor, seq_len_local: int) -> None:
-        """Restate Q (in place) as sequence-on-SP / heads-on-TP; the inherited Shard(0) is stale after the reshape."""
-        heads_local = tt_q.shape[1]
-        assert tt_q.shape[2] == seq_len_local, (
-            f"Q slab {tt_q.shape[2]} is not this chip's chunk rows {seq_len_local}; refusing to declare "
-            "a sequence distribution that does not hold"
-        )
-        assert heads_local * self.tp_factor == self.num_heads, (
-            f"Q holds {heads_local} of {self.num_heads} heads at tp={self.tp_factor}; refusing to declare "
-            "a head distribution that does not hold"
-        )
-        current = tt_q.tensor_topology()
-        placements = [None, None]
-        placements[self.sp_axis] = ttnn.PlacementShard(2)  # sequence
-        placements[self.tp_axis] = ttnn.PlacementShard(1)  # heads
-        tt_q.update_tensor_topology(
-            ttnn.TensorTopology(current.distribution_shape(), placements, current.mesh_coords())
-        )
-
     def set_tp_shard_kv(self, tp_shard_kv: Optional[bool]) -> None:
-        """Sparse always dedups (its gather has no other mode); dense opts in via ring_mla's split-KV path.
+        """Sparse always dedups (its gather has no other mode); dense opts in and reads the cache through a TP latent
+        gather ahead of unrolled-V (_tp_gather_latent).
         Weights and buffers do not depend on it, so a built model can switch layout between runs."""
         if tp_shard_kv is None:
             self.tp_shard_kv = self._has_indexer and self.tp_factor > 1
         else:
+            # The sparse gather always reads the cache as SP x TP striped, so a sparse layer on a TP mesh cannot opt out.
+            assert tp_shard_kv or not (self._has_indexer and self.tp_factor > 1), (
+                "sparse (DSA) MLA always dedups the KV cache over TP; tp_shard_kv=False would make its gather read "
+                "duplicated rows as distinct stripes"
+            )
             self.tp_shard_kv = tp_shard_kv
             assert not tp_shard_kv or self.tp_factor > 1, (
                 f"tp_shard_kv needs a TP axis to dedup across (tp_factor={self.tp_factor}); at tp=1 the "
@@ -2267,11 +2336,11 @@ class ttMLA:
             )
             assert (
                 not tp_shard_kv or self._has_indexer or self.is_chunked
-            ), "dense tp_shard_kv is the chunked ring_mla split-KV path; single-shot prefill has no striped write"
+            ), "dense tp_shard_kv is chunked-prefill only; single-shot prefill has no striped write"
         # Checked here, not on the first chunk after a long weight load.
         if self.tp_shard_kv and not self._has_indexer:
             assert self.sp_axis == 0 and self.tp_axis == 1, (
-                f"dense tp_shard_kv needs SP on mesh axis 0 and TP on axis 1 (split-KV ring_mla), got "
+                f"dense tp_shard_kv needs SP on mesh axis 0 and TP on axis 1 (the block-cyclic cache layout), got "
                 f"sp_axis={self.sp_axis} tp_axis={self.tp_axis}"
             )
             chunk_local = self.active_seq_len // self.sp_factor
@@ -2290,8 +2359,8 @@ class ttMLA:
                 ttnn.FabricConfig.FABRIC_2D_TORUS_Y,
                 ttnn.FabricConfig.FABRIC_2D_TORUS_XY,
             ), (
-                f"dense tp_shard_kv requires a 2D fabric config, got {_fabric}: ring_mla's full-mesh KV "
-                "gather spans both mesh axes. Open the mesh with FABRIC_2D (or a 2D torus variant)."
+                f"dense tp_shard_kv requires a 2D fabric config, got {_fabric}: the TP latent gather and the SP "
+                "ring gather run on different mesh axes. Open the mesh with FABRIC_2D (or a 2D torus variant)."
             )
 
     @property

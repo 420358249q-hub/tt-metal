@@ -10,6 +10,7 @@ tests/test_kv_cache_table.py and tests/sparse_mla/test_sparse_mla.py.
 import math
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -575,6 +576,8 @@ def _run_chunked_prefill(
     profile=False,
     tight_cache=False,
     tp_shard_kv=False,
+    return_outputs=False,
+    trace_time=False,
 ):
     """Unified chunked-prefill scenario, decoupled from the reference.
 
@@ -805,6 +808,7 @@ def _run_chunked_prefill(
     # ---- iterate: interleave users by local iter index (exercises cross-user isolation) ----
     det_failures = []
     profiled_ns = 0.0
+    traced_ns = 0.0
     n_iters = max(len(u["group"]) for u in users)
     logger.info(f"Starting DEVICE chunked prefill: up to {n_iters} iters x {num_users} user(s)")
     for i in range(n_iters):
@@ -889,6 +893,22 @@ def _run_chunked_prefill(
                     tt_out, fwd_ns = _rt_profile_forward_ns(mesh_device, _forward)
                     profiled_ns += fwd_ns
                     logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (realtime profiler)")
+                elif trace_time:
+                    # Host wall-clock of ONE traced replay (as the Kimi MoE perf gate): the eager forward compiles,
+                    # the capture records it, and the replay rewrites the same cache rows with the same data.
+                    tt_out = _forward()
+                    ttnn.synchronize_device(mesh_device)
+                    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+                    _forward()
+                    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+                    ttnn.synchronize_device(mesh_device)
+                    start_ns = time.perf_counter_ns()
+                    ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+                    ttnn.synchronize_device(mesh_device)
+                    fwd_ns = time.perf_counter_ns() - start_ns
+                    ttnn.release_trace(mesh_device, tid)
+                    traced_ns += fwd_ns
+                    logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (traced replay)")
                 else:
                     tt_out = _forward()
                 out_flat = ttnn.to_torch(
@@ -934,6 +954,10 @@ def _run_chunked_prefill(
 
     if profile:
         return profiled_ns
+    if trace_time:
+        return traced_ns
+    if return_outputs:
+        return out_accum
 
     if determinism_check:
         if det_failures:
@@ -1543,3 +1567,96 @@ def test_mla_chunked_perf_check(request, mesh_device, device_params, variant):
         f"device time {total_ns:,.0f} ns outside band [{lower:,.0f}, {upper:,.0f}] "
         f"(expected {K3_CHUNKED_RT_PERF_NS:,} ns, margin +/- {K3_CHUNKED_RT_PERF_MARGIN * 100:.1f}%)"
     )
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "reference,kwargs",
+    [pytest.param(None, kw, id=f"func-{sid}") for sid, kw in _CHUNKED_SCENARIOS]
+    + [pytest.param("trace", dict(iters_isl=[5120] * 11), id="trace-production-50k+5k")],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.timeout(0)
+def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
+    request, mesh_device, device_params, reference, kwargs, variant, use_metadata_tensor
+):
+    """The TP-sharded cache is read back through a TP latent gather into the TP-replicated layout, and everything
+    downstream is unchanged, so the output must equal the TP-replicated (sp_only) run bit for bit, on the same inputs.
+    """
+    if reference == "trace" and not variant.mla_trace_defaults and not MLA_CHUNKED_TRACE_PATH:
+        pytest.skip(f"no golden MLA trace recorded for {variant.name}")
+    topology = per_axis_topology(device_params["fabric_config"])
+    outs = {}
+    for tp_shard_kv in (False, True):
+        outs[tp_shard_kv] = _run_chunked_prefill(
+            request,
+            mesh_device,
+            reference=reference,
+            topology=topology,
+            use_metadata_tensor=use_metadata_tensor,
+            tp_shard_kv=tp_shard_kv,
+            return_outputs=True,
+            **kwargs,
+        )
+    for u, (sp_only, tp_sharded) in enumerate(zip(outs[False], outs[True])):
+        mismatched = (sp_only != tp_sharded).sum().item()
+        assert (
+            mismatched == 0
+        ), f"user {u}: {mismatched} of {sp_only.numel()} output elements differ (tp_sharded vs sp_only)"
+    logger.success(f"✓ tp_sharded output bitwise equal to sp_only ({len(outs[True])} user(s))")
+
+
+# G3 gates for the TP-sharded cache (unrolled_v_sharded_kv_plan.md): traced forward overhead vs sp_only.
+_TP_SHARDED_PERF_POINTS = [
+    pytest.param("kimi_k3", 50 * 1024, 0.015, id="k3-50k"),
+    pytest.param("kimi_k3", 512 * 1024, 0.012, id="k3-512k"),
+    pytest.param("kimi_k2_7", 50 * 1024, 0.020, id="k2_7-50k"),
+    pytest.param("kimi_k2_7", 256 * 1024, 0.015, id="k2_7-256k"),
+]
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [
+        pytest.param(
+            (8, 4),
+            torus_xy_device_params(l1_small_size=1152, trace_region_size=64 * 1024 * 1024),
+            id="torus-xy-8x4",
+        )
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant,prefill_len,max_overhead", _TP_SHARDED_PERF_POINTS, indirect=["variant"])
+@pytest.mark.parametrize("use_metadata_tensor", [True], ids=["metadata"])
+@pytest.mark.skipif(not is_blackhole(), reason="Galaxy perf gate")
+@pytest.mark.timeout(0)
+def test_mla_chunked_tp_sharded_traced_perf(
+    request, mesh_device, device_params, variant, prefill_len, max_overhead, use_metadata_tensor
+):
+    """Traced-replay time of one 5k-chunk MLA forward at a long prefix, TP-sharded cache vs TP-replicated (sp_only),
+    on the same build and machine. The TP-sharded path adds one TP latent gather ahead of the expansion."""
+    topology = per_axis_topology(device_params["fabric_config"])
+    times = {}
+    for tp_shard_kv in (False, True):
+        times[tp_shard_kv] = _run_chunked_prefill(
+            request,
+            mesh_device,
+            reference=None,
+            topology=topology,
+            iters_isl=[5120],
+            prefill_len=prefill_len,
+            use_metadata_tensor=use_metadata_tensor,
+            tp_shard_kv=tp_shard_kv,
+            trace_time=True,
+        )
+    overhead = times[True] / times[False] - 1
+    logger.info(
+        f"{variant.name} {prefill_len} + 5120 traced forward: sp_only {times[False] / 1e6:.3f} ms, "
+        f"tp_sharded {times[True] / 1e6:.3f} ms ({overhead * 100:+.2f}%, gate +{max_overhead * 100:.1f}%)"
+    )
+    assert overhead <= max_overhead, f"tp_sharded overhead {overhead * 100:+.2f}% above +{max_overhead * 100:.1f}%"
