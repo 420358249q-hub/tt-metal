@@ -60,16 +60,14 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
     Scratchpad<uint16_t> window(scratch::act_window);
     Noc noc;
 
-    const uint32_t window_base = window.get_base_address();
-
     uint32_t local_split_row = 0;
     bool initial_from_predecessor = false;
     {
         // The window is free until the first work item, so it doubles as landing space for actual_start.
         const auto actual_start = TensorAccessor(tensor::actual_start);
-        noc.async_read(actual_start, CoreLocalMem<uint32_t>(window_base), sizeof(uint32_t), {.page_id = 0}, {});
+        noc.async_read(actual_start, window, sizeof(uint32_t), {.page_id = 0}, {});
         noc.async_read_barrier();
-        const auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(window_base);
+        const auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(&window[0]);
         const auto topology = kda_chronology::derive(words[0], sp_rank, sp_size, local_rows);
         local_split_row = topology.local_split ? topology.head_rows : 0;
         initial_from_predecessor = topology.rank != topology.first_rank;
@@ -83,10 +81,6 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
     // Every row and tap offset into DRAM and the L1 window is a multiple of block_row_bytes.
     static_assert(block_row_bytes % L1_ALIGNMENT == 0 && block_row_bytes % DRAM_ALIGNMENT == 0);
     const uint32_t tile_bytes = weights.get_entry_size();
-
-    UnicastEndpoint self;
-    const uint32_t self_x = my_x[noc.get_noc_id()];
-    const uint32_t self_y = my_y[noc.get_noc_id()];
 
     // Work items are channel-block-major, so consecutive items on a core share tap weights.
     constexpr uint32_t no_block = ~0U;
@@ -140,12 +134,9 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
 
         for (uint32_t tap = 0; tap < tap_count; ++tap) {
             activation.reserve_back(block_ct);
+            // NoC loopback read of this core's window, shifted by tap rows.
             noc.async_read(
-                self,
-                activation,
-                tile_height * block_row_bytes,
-                {.noc_x = self_x, .noc_y = self_y, .addr = window_base + tap * block_row_bytes},
-                {});
+                window, activation, tile_height * block_row_bytes, {.offset_bytes = tap * block_row_bytes}, {});
             noc.async_read_barrier();
             activation.push_back(block_ct);
         }

@@ -21,15 +21,14 @@ TT_KERNEL void derive() {
     Scratchpad<volatile uint32_t> scratch(scratch::scratch);
     const auto actual_start = TensorAccessor(tensor::actual_start);
     const auto output = TensorAccessor(tensor::output);
-    const auto address = scratch.get_base_address();
-    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-    noc.async_read(actual_start, CoreLocalMem<uint32_t>(address), sizeof(uint32_t), {.page_id = 0}, {});
+    volatile tt_l1_ptr uint32_t* words = &scratch[0];
+    noc.async_read(actual_start, scratch, sizeof(uint32_t), {.page_id = 0}, {});
     noc.async_read_barrier();
     const uint32_t start = words[0];
     auto topology = derive(start, sp_rank, sp_size, local_rows);
     if constexpr (has_actual_end) {
         const auto actual_end = TensorAccessor(*tensor::get_token_if_present<"actual_end">());
-        noc.async_read(actual_end, CoreLocalMem<uint32_t>(address), sizeof(uint32_t), {.page_id = 0}, {});
+        noc.async_read(actual_end, scratch, sizeof(uint32_t), {.page_id = 0}, {});
         noc.async_read_barrier();
         topology = derive_interval(start, words[0], sp_rank, sp_size, local_rows);
     }
@@ -86,8 +85,7 @@ TT_KERNEL void derive() {
                 words[3] = V;
             }
         }
-        noc.async_write(
-            CoreLocalMem<uint32_t>(address), output, selection::record_width * sizeof(uint32_t), {}, {.page_id = row});
+        noc.async_write(scratch, output, selection::record_width * sizeof(uint32_t), {}, {.page_id = row});
         noc.async_write_barrier();
     }
 }
