@@ -429,7 +429,7 @@ class TT_CCL:
             shard_dims = [None, None]
             shard_dims[sp_axis] = 2
             self.mla_chunked_kv_buffers[key] = ttnn.from_torch(
-                torch.zeros(1, 1, seq_len, kvpe_dim),
+                torch.zeros(1, 1, seq_len, kvpe_dim, dtype=torch.bfloat16),
                 device=self.mesh_device,
                 layout=ttnn.TILE_LAYOUT,
                 dtype=dtype,

@@ -1017,8 +1017,8 @@ class ttMLA:
         # on-device rotation/causality offset.
         #
         # Trace-safe metadata path: the SDPA reads its per-chunk scalars on-device -- the all-gather +
-        # SDPA readers take the cache slot from metadata[0] and derive logical_nt / masks from
-        # kv_actual_isl = metadata[1]. Every kernel derives logical_n on-device on this path, so the host
+        # SDPA readers take the cache slot from metadata[0] (a zero slot on the tp_shard_kv path, which reads
+        # the single-slot TP latent buffer) and derive logical_nt / masks from kv_actual_isl = metadata[1]. Every kernel derives logical_n on-device on this path, so the host
         # logical_n is a placeholder = global cache capacity. metadata[0] holds only the user slot, so pass
         # the per-layer factor (kv_cache_num_layers/kv_cache_layer_idx) so the readers recompute the full
         # (user, layer) slot on-device -- otherwise every layer would read layer 0's KV cache.
@@ -2361,6 +2361,14 @@ class ttMLA:
             ), (
                 f"dense tp_shard_kv requires a 2D fabric config, got {_fabric}: the TP latent gather and the SP "
                 "ring gather run on different mesh axes. Open the mesh with FABRIC_2D (or a 2D torus variant)."
+            )
+            # Allocate the shared TP latent slot now, outside any forward or trace capture (the forward looks it up
+            # by the same key).
+            self.tt_ccl.get_mla_tp_latent_slot(
+                seq_len=self.max_seq_len,
+                kvpe_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                sp_axis=self.sp_axis,
+                tp_axis=self.tp_axis,
             )
 
     @property
