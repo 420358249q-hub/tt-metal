@@ -2620,7 +2620,9 @@ def test_high_bw_all_gather_selected_slot_width_gather(mesh_device):
     """A selected slot gathered on the WIDTH dim of a tiled tensor: the tiled height is an outer dim, counted in tile
     rows. Counting it in element rows schedules 32x too many pages and writes past the output."""
     ranks = mesh_device.shape[1]
-    slots, height, width = 3, 64, 64
+    # 64 slots: counting the tiled height in elements would schedule 64 / 2 = 32x the pages of one slot, still inside
+    # the input allocation for low slots, so the bug would overrun the output instead of failing a range check.
+    slots, height, width = 64, 64, 64
     torch.manual_seed(1)
     host = torch.randn(slots, 1, height, ranks * width, dtype=torch.bfloat16)
     tt_in = _make_tensor(
@@ -2637,11 +2639,15 @@ def test_high_bw_all_gather_selected_slot_width_gather(mesh_device):
         ttnn.TILE_LAYOUT,
         ttnn.ReplicateTensorToMesh(mesh_device),
     )
-    for slot in (2, 0):
+    entries = None
+    for slot in (2, 0, 63):
         ttnn.experimental.high_bw_all_gather(tt_in, 3, tt_out, cluster_axis=1, num_links=2, input_batch_index=slot)
         ttnn.synchronize_device(mesh_device)
         for dev_tensor in ttnn.get_device_tensors(tt_out):
             assert torch.equal(ttnn.to_torch(dev_tensor), host[slot : slot + 1]), f"slot {slot} mismatch"
+        if entries is None:
+            entries = mesh_device.num_program_cache_entries()
+        assert mesh_device.num_program_cache_entries() == entries
 
 
 @pytest.mark.parametrize("device_params", [_FABRIC_2D_TORUS_XY_DEVICE_PARAMS], indirect=True)
@@ -2682,3 +2688,83 @@ def test_high_bw_all_gather_outer_blocks_validation(mesh_device, expect_error):
         gather(outer_block_rows=48)
     with expect_error(RuntimeError, "cannot be combined with the row extent"):
         gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_dim_size=ranks * _OUTER_BLOCK_ROWS)
+    prefix = _meta_scalar(mesh_device, 0)
+    with expect_error(RuntimeError, "gathered_outer_blocks and gathered_prefix_tensor are mutually exclusive"):
+        ttnn.experimental.high_bw_all_gather(
+            tt_in,
+            2,
+            tt_out,
+            cluster_axis=1,
+            num_links=2,
+            input_batch_index_tensor=_meta_scalar(mesh_device, 0),
+            gathered_prefix_tensor=prefix,
+            gathered_slab_global=_OUTER_SLAB,
+            outer_block_rows=_OUTER_BLOCK_ROWS,
+            gathered_outer_blocks=1,
+        )
+    # A bad block count on a program-cache HIT is still rejected.
+    gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=2)
+    ttnn.synchronize_device(mesh_device)
+    with expect_error(RuntimeError, "must be in"):
+        gather(outer_block_rows=_OUTER_BLOCK_ROWS, gathered_outer_blocks=_OUTER_BLOCKS + 1)
+    # In block mode the slab is only a unit: one that does not divide by the ring size is valid.
+    ttnn.experimental.high_bw_all_gather(
+        tt_in,
+        2,
+        tt_out,
+        cluster_axis=1,
+        num_links=2,
+        input_batch_index_tensor=_meta_scalar(mesh_device, 0),
+        gathered_prefix_tensor=_meta_scalar(mesh_device, 5),
+        gathered_slab_global=5,
+        outer_block_rows=_OUTER_BLOCK_ROWS,
+    )
+    ttnn.synchronize_device(mesh_device)
+
+    # Blocks split a row dim: a row-major gather of the last dim is rejected by validation itself.
+    rm_in = _make_tensor(
+        mesh_device,
+        torch.zeros(2, 1, 32, ranks * 64, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.ROW_MAJOR_LAYOUT,
+        ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=(None, 3)),
+    )
+    rm_out = _make_tensor(
+        mesh_device,
+        torch.zeros(1, 1, 32, ranks * 64, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.ROW_MAJOR_LAYOUT,
+        ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+    with expect_error(RuntimeError, "cannot be used when gathering the last dim"):
+        ttnn.experimental.high_bw_all_gather(
+            rm_in, 3, rm_out, cluster_axis=1, num_links=2, input_batch_index=0, outer_block_rows=32
+        )
+
+    # One block must cover every worker slice: a 1-page block (32x32) with a scalar count is rejected at build time,
+    # since a cache hit could patch the count down to one block and starve workers.
+    narrow_in = _make_tensor(
+        mesh_device,
+        torch.zeros(2, 1, ranks * 128, 32, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=(None, 2)),
+    )
+    narrow_out = _make_tensor(
+        mesh_device,
+        torch.zeros(1, 1, ranks * 128, 32, dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.TILE_LAYOUT,
+        ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+    with expect_error(RuntimeError, "one 32-row block is 1 pages"):
+        ttnn.experimental.high_bw_all_gather(
+            narrow_in,
+            2,
+            narrow_out,
+            cluster_axis=1,
+            num_links=2,
+            input_batch_index=0,
+            outer_block_rows=32,
+            gathered_outer_blocks=4,
+        )

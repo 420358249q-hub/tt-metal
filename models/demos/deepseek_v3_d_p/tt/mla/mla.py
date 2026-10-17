@@ -1085,6 +1085,10 @@ class ttMLA:
             region % ttnn.TILE_SIZE == 0 and rows_dedup % region == 0
         ), f"TP latent gather needs whole tile-aligned regions: {rows_dedup} cache rows, region {region}"
         chunk_size_global = seq_len_local * self.sp_factor
+        assert rows_dedup * self.tp_factor * self.sp_factor == self.max_seq_len, (
+            f"cache holds {rows_dedup * self.tp_factor * self.sp_factor} rows but this layer was built for "
+            f"{self.max_seq_len}; the TP latent slot is sized (and pre-allocated) from max_seq_len"
+        )
         slot_buf = self.tt_ccl.get_mla_tp_latent_slot(
             seq_len=rows_dedup * self.tp_factor * self.sp_factor,
             kvpe_dim=kvpe_dim,
@@ -2362,14 +2366,15 @@ class ttMLA:
                 f"dense tp_shard_kv requires a 2D fabric config, got {_fabric}: the TP latent gather and the SP "
                 "ring gather run on different mesh axes. Open the mesh with FABRIC_2D (or a 2D torus variant)."
             )
-            # Allocate the shared TP latent slot now, outside any forward or trace capture (the forward looks it up
-            # by the same key).
+            # Allocate the shared TP latent slot and the zero slot id now, outside any forward or trace capture (the
+            # forward looks both up by the same keys).
             self.tt_ccl.get_mla_tp_latent_slot(
                 seq_len=self.max_seq_len,
                 kvpe_dim=self.kv_lora_rank + self.qk_rope_head_dim,
                 sp_axis=self.sp_axis,
                 tp_axis=self.tp_axis,
             )
+            self.tt_ccl.get_zero_slot_tensor()
 
     @property
     def tp_shard_kv_axis(self) -> Optional[int]:

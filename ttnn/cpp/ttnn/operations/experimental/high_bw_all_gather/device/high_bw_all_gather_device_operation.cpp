@@ -268,6 +268,9 @@ void validate_slot_extent_control_mix(const HighBwAllGatherParams& args, const H
                 args.outer_block_rows,
                 tile_h);
         }
+        // Mirrors derive_page_geometry's outer count. Element rows equal page rows here only because a tiled tensor
+        // must gather its row dim (rank - 2) above, so no tiled height sits between batch and dim; keep the two in
+        // step if that ever changes.
         uint32_t outer_count = shape[gather_dim] / args.outer_block_rows;
         for (int32_t i = 1; i < gather_dim; ++i) {
             outer_count *= shape[i];
