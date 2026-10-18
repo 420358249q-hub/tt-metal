@@ -108,7 +108,7 @@ assert MTP_LEVELS >= 0, f"PREFILL_MTP_LEVELS must be >= 0, got {MTP_LEVELS}"
 NUM_MTP_TOKENS = num_mtp_tokens(MTP_LEVELS)
 TOKEN_ID_BYTES = 4
 _MTP_PAD_AS_INT32 = MTP_PAD_TOKEN_ID - (1 << 32)
-CHUNK_METADATA_SIZE_BYTES = METADATA_SIZE_BYTES
+CHUNK_METADATA_SIZE_BYTES = ADAPTER.prefill_metadata_size_bytes(CHUNK_SIZE, _sp, NUM_USERS)
 
 D2D_METADATA_SIZE_BYTES = METADATA_SIZE_BYTES + (4 if MTP_LEVELS else 0)
 SYNC_PER_CHUNK = os.environ.get("PREFILL_SYNC_PER_CHUNK", "0") == "1"
@@ -191,11 +191,7 @@ def build_layer_completion_sink(producer, *, source_rank, num_layers, ack_idx_of
 
 def _decode_metadata(metadata_msg: ttnn.Tensor) -> dict:
     m = ttnn.to_torch(ttnn.get_device_tensors(metadata_msg)[0]).view(torch.int32).flatten()
-    return {
-        "slot_id": int(m[0]),
-        "actual_start": int(m[1]),
-        "actual_end": int(m[2]),
-    }
+    return ADAPTER.decode_prefill_metadata(m.tolist())
 
 
 def mtp_provided_levels(mtp_tokens, meta: dict) -> int:
@@ -426,17 +422,27 @@ def _compute_and_send(
     )
 
     mtp_kwargs = {"mtp_tokens": mtp_tokens, "provided_levels": meta["provided_levels"]} if MTP_LEVELS else {}
-    out = runtime.prefill_chunk(
-        inp,
-        kv_caches,
-        slot_id=meta["slot_id"],
-        actual_start=meta["actual_start"],
-        actual_end=meta["actual_end"],
-        request_id=c,
-        d2h_service=d2h_service,
-        metadata_msg=metadata_msg,
-        **mtp_kwargs,
-    )
+    if "segments" in meta:
+        out = runtime.prefill_batch(
+            inp,
+            kv_caches,
+            segments=meta["segments"],
+            d2h_service=d2h_service,
+            metadata_msg=metadata_msg,
+        )
+    else:
+        out = runtime.prefill_chunk(
+            inp,
+            kv_caches,
+            slot_id=meta["slot_id"],
+            actual_start=meta["actual_start"],
+            actual_end=meta["actual_end"],
+            request_id=c,
+            d2h_service=d2h_service,
+            metadata_msg=metadata_msg,
+            **mtp_kwargs,
+        )
+
     if SYNC_PER_CHUNK:
         ttnn.synchronize_device(runtime.mesh_device)
         compute_ms = (time.perf_counter() - t_perf) * 1000.0
