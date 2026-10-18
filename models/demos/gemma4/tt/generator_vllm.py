@@ -2989,6 +2989,10 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         # instead — a request that really finished stops being touched and ages
         # out naturally. ``authoritative`` now only marks a call whose key set
         # is a true running set, which is what refreshes recency.
+        fresh = getattr(self, "_g4_ring_keys_since_authoritative", None)
+        if fresh is None:
+            fresh = set()
+            self._g4_ring_keys_since_authoritative = fresh
         if authoritative:
             for k in keys:
                 if k is not None and k in slot_map:
@@ -2997,6 +3001,7 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
             # absent from it — LRU order alone can front a LIVE request that
             # simply was not scheduled in recent decode steps.
             self._g4_last_authoritative_keys = {k for k in keys if k is not None}
+            fresh.clear()
         used = set(slot_map.values())
         slots = []
         for k in keys:
@@ -3013,10 +3018,19 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     # the map full; the scheduler caps concurrency at
                     # ``max_slots``, so the oldest entry is necessarily a
                     # departed request. Evict it rather than colliding on 0.
+                    # Keys bound by a prefill since the last authoritative step are
+                    # live requests that no decode step has listed yet; they are
+                    # absent from that set exactly like departed keys, so they must
+                    # never be the victim. Otherwise a long request that finished
+                    # (still in the last running set, hence protected) followed by
+                    # a burst that fills every slot evicted the burst's FIRST request
+                    # for its 32nd, two live users shared one ring and the first one
+                    # decoded garbage (12B bounded, 2026-10-18).
                     last_auth = getattr(self, "_g4_last_authoritative_keys", None)
+                    candidates = [vk for vk in slot_map if vk not in fresh] or list(slot_map)
                     victim = next(
-                        (vk for vk in slot_map if last_auth is not None and vk not in last_auth),
-                        next(iter(slot_map)),
+                        (vk for vk in candidates if last_auth is not None and vk not in last_auth),
+                        candidates[0],
                     )
                     slot = slot_map.pop(victim)
                     logger.warning(
@@ -3027,6 +3041,8 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     )
                 slot_map[k] = slot
                 used.add(slot)
+                if not authoritative:
+                    fresh.add(k)
             slots.append(slot)
         return slots
 
