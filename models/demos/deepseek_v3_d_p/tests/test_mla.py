@@ -7,6 +7,8 @@ chunked perf gate. ``run_mla_inference`` is the shared single-shot forward helpe
 tests/test_kv_cache_table.py and tests/sparse_mla/test_sparse_mla.py.
 """
 
+import hashlib
+import inspect
 import math
 import os
 import re
@@ -585,6 +587,55 @@ def _poison_tp_latent_slot(mesh_device, tt_ccl, *, seq_len, kvpe_dim, sp_axis, t
         )
 
 
+def _weights_digest(key, weights):
+    """Fold the weights' names, shapes, dtypes and a strided sample of their values into a hashlib object."""
+    for name in sorted(weights):
+        t = weights[name]
+        key.update(f"{name}{tuple(t.shape)}{t.dtype}".encode())
+        key.update(t.float().flatten()[:: max(1, t.numel() // 4096)].numpy().tobytes())
+
+
+def _test_weight_cache_dir(weights, mesh_device):
+    """Opt-in (MLA_TEST_WEIGHT_CACHE=<dir>) on-disk cache of the converted MLA weights, so repeated local runs skip the
+    host-side conversion (about 2 minutes per K3 build). Keyed by the weights' values, the mesh shape and the
+    conversion code, so a changed seed, mesh or converter never reads a stale entry. Off (None) by default and in CI."""
+    root = os.getenv("MLA_TEST_WEIGHT_CACHE")
+    if not root:
+        return None
+    key = hashlib.sha1()
+    key.update(inspect.getsource(ttMLA._convert_and_cache_weights).encode())
+    key.update(repr(tuple(mesh_device.shape)).encode())
+    _weights_digest(key, weights)
+    path = Path(root) / key.hexdigest()[:16]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cached_cpu_mla_reference(config, weights, hidden):
+    """cpu_mla_reference, with an opt-in (MLA_TEST_REF_CACHE=<dir>) on-disk cache: the K3 50k scenarios spend about 8
+    minutes each in the torch reference. Keyed by the reference module's source, the config, the weights and the full
+    input, so any change recomputes. Off by default and in CI."""
+    root = os.getenv("MLA_TEST_REF_CACHE")
+    if not root:
+        return cpu_mla_reference(config, weights, hidden)
+    key = hashlib.sha1()
+    key.update(Path(inspect.getsourcefile(cpu_mla_reference)).read_bytes())
+    key.update(repr(sorted((k, repr(v)) for k, v in vars(config).items() if k != "max_seq_len")).encode())
+    _weights_digest(key, weights)
+    key.update(repr(tuple(hidden.shape)).encode())
+    key.update(hidden.view(torch.int16).numpy().tobytes())
+    path = Path(root) / f"{key.hexdigest()[:20]}.pt"
+    if path.exists():
+        cached = torch.load(path, weights_only=True)
+        return cached["ref_out"], cached["ref_kvpe"]
+    ref_out, ref_kvpe = cpu_mla_reference(config, weights, hidden)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save({"ref_out": ref_out, "ref_kvpe": ref_kvpe}, tmp)
+    tmp.rename(path)
+    return ref_out, ref_kvpe
+
+
 def _run_chunked_prefill(
     request,
     mesh_device,
@@ -727,7 +778,7 @@ def _run_chunked_prefill(
         elif reference == "cpu":
             torch.manual_seed(42 + u)
             hidden = torch.randn(total_len, hidden_size, dtype=torch.bfloat16)
-            ref_out, ref_kvpe = cpu_mla_reference(config, weights, hidden)
+            ref_out, ref_kvpe = _cached_cpu_mla_reference(config, weights, hidden)
         else:  # None -> functional / perf, no reference
             torch.manual_seed(100 + u)
             hidden = torch.randn(total_len, hidden_size, dtype=torch.bfloat16)
@@ -762,6 +813,7 @@ def _run_chunked_prefill(
         layer_num=num_cache_layers,
         # None, not False: False would turn off a sparse variant's dedup.
         tp_shard_kv=True if tp_shard_kv else None,
+        weight_cache_path=_test_weight_cache_dir(weights, mesh_device),
     )
     # The TP latent prefetch's sub-device manager must not outlive the mesh, whatever the outcome.
     request.addfinalizer(mla_tt.release_sparse_mla_overlap_manager)
