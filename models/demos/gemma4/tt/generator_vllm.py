@@ -2398,18 +2398,16 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         # still references (#51186).
         if any(getattr(m, "_invalidate_decode_traces_after_page_table_realloc", False) for m in self.model):
             after_warmup = bool(getattr(self, "_decode_warmup_complete", False))
-            self.trace_ids_decode = defaultdict(lambda: None)
-            self.trace_inputs_decode = defaultdict(lambda: None)
-            self.trace_output_decode = defaultdict(lambda: None)
-            self._prev_decode_batch = None
             for m in self.model:
                 m._invalidate_decode_traces_after_page_table_realloc = False
-            log = logger.error if after_warmup else logger.warning
             suffix = " [AFTER WARMUP — unsafe under async_scheduling]" if after_warmup else ""
-            log(
-                "Gemma4 vLLM: cleared decode traces after per-layer page-table "
-                f"buffer grow (addresses changed){suffix}"
-            )
+            reason = f"per-layer page-table buffer grow (addresses changed){suffix}"
+            # Release the stale Metal traces as the trace guard does: forgetting only their
+            # ids leaked the trace-region buffers (a 1.2 GB region was spent after 45
+            # re-captures, TT_FATAL at the next capture) and dropped the sampled-token
+            # feedback binding the helper keeps.
+            self._g4_release_decode_traces(reason)
+            (logger.error if after_warmup else logger.warning)("Gemma4 vLLM: cleared decode traces after {}", reason)
         t0 = time.perf_counter()
         with self._route_per_layer_page_tables(per_submesh):
             # Route through ``ChunkedPrefillPageTableGuardMixin.decode_forward``

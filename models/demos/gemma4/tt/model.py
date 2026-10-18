@@ -220,6 +220,22 @@ def _inject_missing_kv_shared_attention_weights(state_dict, hf_config, kv_shared
             )
 
 
+def lane_page_table_device_rows(host_rows: int, lanes: int, lane_slots: int) -> int:
+    """Rows a host per-layer page table occupies per mesh column once lane-sharded.
+
+    Mirrors ``Gemma4Model._page_table_host_layout``: a single-row table lands on its
+    owner lane (one row per column), a ``lanes``-row table is the lane-parallel prefill
+    layout (one row per column), anything else pads to the ``lanes * lane_slots`` frame
+    (``lane_slots`` rows per column). The persistent-buffer grow check compares against
+    this; mapping the lane-parallel layout to the frame reallocated the buffers and
+    dropped the decode traces after every lane-router prefill.
+    """
+    full = lanes * lane_slots
+    if host_rows == 1 or (host_rows == lanes and lanes != full):
+        return 1
+    return lane_slots
+
+
 class Gemma4Model:
     # Generator-interface flag. PLI models (E2B/E4B) recompute host per-layer
     # inputs from the token every step, so their decode-trace input buffers
@@ -1734,9 +1750,8 @@ class Gemma4Model:
                 except (TypeError, IndexError, AttributeError):
                     continue
                 if self.mesh_config is not None and getattr(self.mesh_config, "lane_sharded", False):
-                    # Device shapes are per column under lanes: a single-row table shards to 1 row,
-                    # anything else pads to the frame and shards to lane_slots rows.
-                    host_b = 1 if host_b == 1 else self._lane_slots
+                    # Device shapes are per column under lanes (see _page_table_host_layout).
+                    host_b = lane_page_table_device_rows(host_b, self.mesh_config.lanes, self._lane_slots)
                 if host_b > dev_b or host_w > dev_w:
                     needs_grow = True
                     break
