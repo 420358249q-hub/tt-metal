@@ -47,7 +47,11 @@ from models.demos.gemma4.tt.generator_trace import (
     should_auto_enable_bounded_sliding,
     warmup_gemma4_model_prefill,
 )
-from models.demos.gemma4.tt.generator_utils import filter_warmup_sampling_params, merge_soft_tokens  # noqa: F401
+from models.demos.gemma4.tt.generator_utils import (  # noqa: F401
+    filter_warmup_sampling_params,
+    items_within_prefill_window,
+    merge_soft_tokens,
+)
 from models.demos.gemma4.tt.model_config import Gemma4ModelArgs
 from models.demos.gemma4.tt.vision.multimodal_embedder import Gemma4MultimodalEmbedder
 from models.demos.gemma4.tt.vision.unified_embedder import Gemma4UnifiedVisionEmbedder, has_unified_vision_weights
@@ -386,6 +390,9 @@ _GEMMA4_MM_FIELD_KEYS = _GEMMA4_MM_PAYLOAD_KEYS + (
     "video_num_soft_tokens",
     "video_timestamps",
     "input_features_mask",
+    # the per-item placeholder ranges the plugin forwards next to the payloads
+    "mm_placeholder_offsets",
+    "mm_placeholder_lengths",
 )
 
 
@@ -1000,10 +1007,21 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     return items + [None] * (batch_size - len(items))
             return [None] * batch_size
 
-        def _items(value):
+        off_per_user = _per_slot("mm_placeholder_offsets")
+        len_per_user = _per_slot("mm_placeholder_lengths")
+
+        def _items(value, window=None):
+            """The non-None items of one per-request list; with ``window`` (``(u, end)``), only
+            those whose placeholders end inside the prefill window (see
+            ``items_within_prefill_window``). The lists are aligned with the request's
+            multimodal items, so the same indices select a modality's companion fields."""
             if value is None:
                 return []
             items = list(value) if isinstance(value, (list, tuple)) else [value]
+            if window is not None:
+                u, end = window
+                inside = set(items_within_prefill_window(off_per_user[u], len_per_user[u], end))
+                items = [t if i in inside else None for i, t in enumerate(items)]
             return [t for t in items if t is not None]
 
         def _batched(t):
@@ -1019,7 +1037,9 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         staged = [None] * batch_size
         for u in range(batch_size):
             soft = []
-            pvs, ips = _items(pv_per_user[u]), _items(ip_per_user[u])
+            # The merge covers the prompt up to this chunk's end: items placed past it wait.
+            window = (u, int(prompt_lens[u]) if prompt_lens is not None else int(tokens.shape[-1]))
+            pvs, ips = _items(pv_per_user[u], window), _items(ip_per_user[u], window)
             if pvs:
                 if len(pvs) != len(ips):
                     raise ValueError(f"user {u}: {len(pvs)} images but {len(ips)} position-id tensors")
@@ -1027,7 +1047,7 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     self._vision_to_host(self.encode_vision(_batched(pv), _batched(ip))) for pv, ip in zip(pvs, ips)
                 ]
                 soft.append((self.image_token_id, torch.cat(chunks, dim=0)))
-            vpvs, vips = _items(vpv_per_user[u]), _items(vip_per_user[u])
+            vpvs, vips = _items(vpv_per_user[u], window), _items(vip_per_user[u], window)
             if vpvs:
                 if self.video_token_id is None:
                     raise RuntimeError("video input for a checkpoint without a video placeholder id")
@@ -1039,7 +1059,7 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     for f in range(int(vpv.shape[0])):
                         chunks.append(self._vision_to_host(self.encode_vision(vpv[f : f + 1], vip[f : f + 1])))
                 soft.append((self.video_token_id, torch.cat(chunks, dim=0)))
-            afs, ams = _items(af_per_user[u]), _items(am_per_user[u])
+            afs, ams = _items(af_per_user[u], window), _items(am_per_user[u], window)
             if afs:
                 if self.embed_audio is None:
                     raise RuntimeError("audio input for a checkpoint without an audio embedder (31B has no audio)")

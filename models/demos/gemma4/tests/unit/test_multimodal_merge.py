@@ -4,7 +4,7 @@
 audio soft tokens land on their own placeholder slots, in prompt order, in one list."""
 import torch
 
-from models.demos.gemma4.tt.generator_utils import merge_soft_tokens
+from models.demos.gemma4.tt.generator_utils import items_within_prefill_window, merge_soft_tokens
 
 IMG, VID, AUD, PAD = 258880, 258884, 258881, 0
 
@@ -75,3 +75,20 @@ def test_merge_cached_prefix_fills_trailing_placeholders(expect_error):
     # ... and so is a shortfall with no cached prefix at all
     with expect_error(ValueError, "Placeholder count"):
         merge_soft_tokens(ids, [(IMG, _embeds(3, 1))], PAD)
+
+
+def test_items_past_the_chunk_end_wait_for_a_later_chunk():
+    # Chunked prefill under load: the first chunk of a 1200-token prompt ends at 300,
+    # before its image (offset 420, 270 placeholders); the plugin still forwards the
+    # image, so it must be left out of this chunk's merge and taken by the next.
+    assert items_within_prefill_window([420], [270], 300) == []
+    assert items_within_prefill_window([420], [270], 1200) == [0]
+    # Several items: the third lies past the end, the first two (one of them inside a
+    # cached prefix) are inside.
+    assert items_within_prefill_window([10, 420, 900], [270, 270, 256], 700) == [0, 1]
+    # The window never ends inside an item (vLLM disable_chunked_mm_input); an exact end
+    # is inside.
+    assert items_within_prefill_window([10], [270], 280) == [0]
+    # Older plugins without ranges: every item is kept, as before.
+    assert items_within_prefill_window(None, None, 300) == []
+    assert items_within_prefill_window([None, 420], [None, 270], 300) == [0]

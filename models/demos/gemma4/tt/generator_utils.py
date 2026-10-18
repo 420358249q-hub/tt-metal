@@ -87,3 +87,26 @@ def merge_soft_tokens(input_ids: torch.Tensor, soft_tokens, pad_token_id: int, *
     llm_ids = input_ids.clone()
     llm_ids[placeholder_mask] = pad_token_id
     return llm_ids, positions, merged_embeds
+
+
+def items_within_prefill_window(offsets, lengths, window_end: int):
+    """Indices of a request's multimodal items whose placeholders end inside ``window_end``.
+
+    The plugin forwards every item of a scheduled request on every prefill step, while
+    a chunked prefill only covers the prompt up to the chunk's end. An item whose
+    placeholders start past that end has no slots yet and belongs to a later chunk;
+    merging it now would fail the placeholder count. vLLM never ends a chunk inside an
+    item (``disable_chunked_mm_input``), so an item is either fully inside the window or
+    fully past it. ``offsets`` / ``lengths`` are the per-item ``mm_position`` lists the
+    plugin forwards (``mm_placeholder_offsets`` / ``mm_placeholder_lengths``); an item
+    without a range (older plugins) is kept.
+    """
+    n = max(len(offsets or ()), len(lengths or ()))
+    kept = []
+    for i in range(n):
+        offset = offsets[i] if offsets is not None and i < len(offsets) else None
+        length = lengths[i] if lengths is not None and i < len(lengths) else None
+        if offset is not None and length is not None and int(offset) + int(length) > int(window_end):
+            continue
+        kept.append(i)
+    return kept
