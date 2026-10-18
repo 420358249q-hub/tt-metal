@@ -46,7 +46,7 @@ The rest of the change:
 | E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k; SDPA compute-bound | ◐ | **Timing met.** Phase 2, steady-state traced, `sp_only` vs absorbed: K3 512k −23.8%, K2.7 256k −25.1%, K3 50k −20.7%, K2.7 50k −22.7%; `tp_sharded` with the prefetch is within ±1% of `sp_only` (table below), one run each. **The ring-vs-compute split is not measured.** The SDPA program (realtime profiler) drops 17–18% when only its matmuls go to LoFi (K3 512k 42.35 → 34.86 ms, K2.7 256k 14.74 → 12.18 ms, one run each), so compute is on the critical path and the program is not ring-gather-bound. It does not separate exposed exchange or gather waits from compute (LoFi also speeds the expansion). Method: `test_mla.py`'s profile mode with `num_cache_layers=3`, `ttMLA.sdpa_matmul_fidelity` set to LoFi after construction (a local scratch harness) |
 | E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet. **Phase 2:** X4 4/4 with allocation tracking |
 | E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 `absorbed` passes (with per-layer weight scaling added for E4) |
-| E6 | Two reviews per commit | ◐ | Phase 1 (`c19695fd7b5`), Phase 2 (`69f2c38e874`) and their review rounds reviewed by both, no open blocker or major (`reviews/`). The latest fix commit is pending review |
+| E6 | Two reviews per commit | ✅ | Every expanded-K code and doc commit, Phase 1 (`c19695fd7b5`) and Phase 2 (`69f2c38e874`) through `3124e893b07`, reviewed by both; findings fixed or answered in `reviews/`. The final commit only adds the last review's log |
 
 ## Accuracy (E2)
 
@@ -119,7 +119,7 @@ schedule:
 
 ## Next steps
 
-1. Review the latest fix commit (E6). Measure the ring-vs-compute split (per-RISC wait time) for E3's profiler criterion.
+1. Measure the ring-vs-compute split (per-RISC wait time) for E3's profiler criterion.
 2. E1: an fp32 reference for rotated starts and short → long → short sequences (today checked only against absorbed).
 3. E4: trace the prefetch-off case too.
 4. Phase 3: chunk retune for the expanded kernel; head groups of 4 (other schedules); model-level runs with weights
