@@ -44,7 +44,12 @@ void kernel_main() {
     constexpr uint32_t cb_wuk = get_named_compile_time_arg_val("cb_wuk");
     constexpr uint32_t cb_kexp = get_named_compile_time_arg_val("cb_kexp");
     constexpr uint32_t kKExpandLatentRows = 512 / 32;
-    constexpr uint32_t wuk_tiles = k_expand ? (DHt_qk - (DHt - kKExpandLatentRows)) * kKExpandLatentRows : 0;
+    // Head groups (pairs of cores per head) split the expansion; W_UK then carries only this core's rows.
+    constexpr uint32_t k_expand_group = get_named_compile_time_arg_val("k_expand_group");
+    constexpr uint32_t cb_kexp_own = get_named_compile_time_arg_val("cb_kexp_own");
+    constexpr uint32_t cb_kexp_peer = get_named_compile_time_arg_val("cb_kexp_peer");
+    constexpr uint32_t wuk_tiles =
+        k_expand ? (DHt_qk - (DHt - kKExpandLatentRows)) / k_expand_group * kKExpandLatentRows : 0;
     constexpr uint32_t Sq_chunk_t = get_compile_time_arg_val(3);
     constexpr uint32_t Sk_chunk_t = get_compile_time_arg_val(4);
     constexpr uint32_t q_local_padded_Nt [[maybe_unused]] = get_compile_time_arg_val(5);
@@ -242,6 +247,12 @@ void kernel_main() {
         (!rotated_q_split_enabled && !(has_sliding_window && seg_accum_enabled) && use_streaming_compute));
     // The K split never runs with the rotated split, so its runtime arg takes the rotated block's slot.
     [[maybe_unused]] const uint32_t ksplit_idx = ksplit_enabled ? get_arg_val<uint32_t>(rotated_args_base) : 0;
+    // Expanded-K head groups: this core's rank, the last runtime arg (after the rotated pairs or the K-split band).
+    [[maybe_unused]] const uint32_t k_expand_rank =
+        (k_expand && k_expand_group > 1)
+            ? get_arg_val<uint32_t>(
+                  rotated_args_base + (rotated_q_split_enabled ? 2 * ring_size : 0) + (ksplit_enabled ? 1 : 0))
+            : 0;
     const bool ksplit_active = ksplit_enabled && q_per_core == 1;
     const bool seg_active = seg_accum_enabled && q_per_core == 1;
     bool seg_state_valid = false;
@@ -659,7 +670,10 @@ void kernel_main() {
                 DHt_qk,
                 k_expand ? cb_kexp : INVALID_CB,
                 k_expand ? cb_wuk : INVALID_CB,
-                k_expand ? kKExpandLatentRows : 0>(
+                k_expand ? kKExpandLatentRows : 0,
+                k_expand ? k_expand_group : 1,
+                (k_expand && k_expand_group > 1) ? cb_kexp_own : INVALID_CB,
+                (k_expand && k_expand_group > 1) ? cb_kexp_peer : INVALID_CB>(
                 // Rotated: iterate [0, my_count) as POSITIONS, each mapped to its flat chunk id via
                 // the fixed base range or moving remainder ID. Static: [start, end) is already flat.
                 rotated_q_split_enabled ? 0u : global_q_start,
@@ -697,7 +711,8 @@ void kernel_main() {
                 packed_sources ? packed_source_ids : nullptr,
                 packed_sources ? source_group_size : 0,
                 packed_schedule.rows(ring_iter),
-                padded_q_slots);
+                padded_q_slots,
+                k_expand_rank);
             if constexpr (has_sliding_window && ksplit_enabled) {
                 // Sliding bands split the unit's work plan, which can be shorter than the band count near the
                 // sequence start: an empty band stages no state.

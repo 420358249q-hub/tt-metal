@@ -2085,14 +2085,31 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t cb_kv_pad_derived = allocate_cb(64, 1, tt::DataFormat::UInt32);
     // Expanded K: the core's head's W_UK (pushed and popped with Q, so double-buffered like it) and the assembled
     // per-head K^T chunk [expanded no-PE rows | latent PE rows] the QK reads (double-buffered).
-    const uint32_t wuk_tiles =
-        (kKExpandNopeDim / tt::constants::TILE_HEIGHT) * (kKExpandLatentDim / tt::constants::TILE_WIDTH);
+    //
+    // Head groups (expanded-K PLAN.md section 3.4): when each head's Q chunks sit one per core and walk the same K
+    // chunks (one Q chunk per core, per-head V chains, batch 1), the num_q_chunks cores of a (K-split band, head) split
+    // the expansion: each expands kexp_own_rows of the no-PE tile rows of every K chunk and exchanges them with its
+    // peer, so each K chunk is expanded once per group instead of once per core. Only pairs for now; otherwise every
+    // core expands its whole head.
+    const uint32_t kexp_nope_rows = kKExpandNopeDim / tt::constants::TILE_HEIGHT;
+    const uint32_t k_expand_group =
+        (k_expand && use_head_chain && build_kv_chains && max_q_per_core == 1 && num_q_chunks == 2) ? 2u : 1u;
+    const uint32_t kexp_own_rows = kexp_nope_rows / k_expand_group;
+    const uint32_t wuk_tiles = kexp_own_rows * (kKExpandLatentDim / tt::constants::TILE_WIDTH);
     const tt::DataFormat wuk_df =
         k_expand ? tt::tt_metal::datatype_to_dataformat_converter(tensor_args.k_expand_weight->dtype()) : k_df;
     // Disabled, they alias live CBs so compile-time tile-size queries in the kernels stay valid (as cb_attention_sink).
     const uint32_t cb_wuk =
         k_expand ? allocate_tile_cb(wuk_tiles * q_buffer_factor, tt::tile_size(wuk_df), wuk_df) : cb_q_in;
     const uint32_t cb_kexp = k_expand ? allocate_tile_cb(DHt_qk * Sk_chunk_t * 2, k_tile_size, k_df) : cb_k_in;
+    // Head groups: this core's expanded rows on their way to the peer (compute -> reader) and the peer's arriving rows
+    // (reader -> compute), both double-buffered.
+    const bool k_expand_grouped = k_expand_group > 1;
+    const uint32_t cb_kexp_own =
+        k_expand_grouped ? allocate_tile_cb(kexp_own_rows * Sk_chunk_t * 2, k_tile_size, k_df) : cb_k_in;
+    const uint32_t cb_kexp_peer =
+        k_expand_grouped ? allocate_tile_cb((kexp_nope_rows - kexp_own_rows) * Sk_chunk_t * 2, k_tile_size, k_df)
+                         : cb_k_in;
 
     const std::vector<uint32_t> cb_compile_time_args = {
         cb_q_in,     cb_k_in,     cb_v_in,         cb_mask_in,       cb_scale_in,     cb_identity_scale_in,
@@ -2800,6 +2817,41 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     for (auto* args : {&reader_compile_time_args, &writer_compile_time_args, &compute_compile_time_args}) {
         args->push_back(rotated_max_slots_ct);
     }
+    // Expanded-K head groups: the slot-free credit and the data-arrived count of the slice exchange (cumulative
+    // counts, reset by every program launch).
+    uint32_t kexp_credit_sem_id = 0;
+    uint32_t kexp_data_sem_id = 0;
+    if (k_expand_grouped) {
+        for (uint32_t* sem_id : {&kexp_credit_sem_id, &kexp_data_sem_id}) {
+            *sem_id = static_cast<uint32_t>(desc.semaphores.size());
+            TT_FATAL(*sem_id < 16, "expanded-K head groups need 2 semaphores, but {} are already allocated", *sem_id);
+            desc.semaphores.push_back(SemaphoreDescriptor{
+                .id = *sem_id,
+                .core_type = tt::CoreType::WORKER,
+                .core_ranges = core_grid_set,
+                .initial_value = 0,
+            });
+        }
+    }
+    // Each core's rank in its head group and its peer: head_segments[band * NH + head] lists the group's cores.
+    std::vector<uint32_t> kexp_rank(num_cores, 0);
+    std::vector<uint32_t> kexp_peer(num_cores, 0);
+    if (k_expand_grouped) {
+        for (const auto& segs : head_segments) {
+            if (segs.empty()) {
+                continue;
+            }
+            TT_FATAL(
+                segs.size() == k_expand_group,
+                "expanded-K head group of {} cores, expected {} (one Q chunk per core)",
+                segs.size(),
+                k_expand_group);
+            for (uint32_t r = 0; r < k_expand_group; ++r) {
+                kexp_rank[segs[r].core_idx] = r;
+                kexp_peer[segs[r].core_idx] = segs[1 - r].core_idx;
+            }
+        }
+    }
     // Reducer's ready semaphore: one bit per sender, set once its state is staged.
     uint32_t ksplit_sem_id = 0;
     if (ksplit_count > 1) {
@@ -3166,6 +3218,11 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         kernel->named_compile_time_args.emplace_back("dht_qk", DHt_qk);
         kernel->named_compile_time_args.emplace_back("cb_wuk", cb_wuk);
         kernel->named_compile_time_args.emplace_back("cb_kexp", cb_kexp);
+        kernel->named_compile_time_args.emplace_back("k_expand_group", k_expand_group);
+        kernel->named_compile_time_args.emplace_back("cb_kexp_own", cb_kexp_own);
+        kernel->named_compile_time_args.emplace_back("cb_kexp_peer", cb_kexp_peer);
+        kernel->named_compile_time_args.emplace_back("kexp_credit_sem", kexp_credit_sem_id);
+        kernel->named_compile_time_args.emplace_back("kexp_data_sem", kexp_data_sem_id);
     }
     reader_kernel.named_compile_time_args.emplace_back(
         "k_row_Wt", input_tensor_k.padded_shape()[3] / tt::constants::TILE_WIDTH);
@@ -3289,6 +3346,13 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         // Expanded K: W_UK's address, the last reader arg (patched on cache hits like the other buffers).
         if (k_expand) {
             reader_args.push_back(tensor_args.k_expand_weight->buffer());
+            // Head groups: this core's rank and its peer's physical core.
+            if (k_expand_grouped) {
+                const auto& peer_phys = core_work[kexp_peer[i]].physical_core;
+                reader_args.push_back(kexp_rank[i]);
+                reader_args.push_back(peer_phys.x);
+                reader_args.push_back(peer_phys.y);
+            }
         }
         reader_kernel.emplace_runtime_args(core, reader_args.args);
 
@@ -3396,6 +3460,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         }
         if (ksplit_count > 1) {
             compute_args.push_back(ksplit_band(i));
+        }
+        // Expanded-K head groups: this core's rank (which no-PE rows it expands).
+        if (k_expand_grouped) {
+            compute_args.push_back(kexp_rank[i]);
         }
         compute_kernel.emplace_runtime_args(core, compute_args.args);
     }

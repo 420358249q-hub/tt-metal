@@ -1,6 +1,7 @@
 # Expanded K on arrival: status
 
-Milestone: Phase 1 of [PLAN.md](PLAN.md). Every core expands its head's K itself, with no exchange. Branch
+Milestone: Phases 1 and 2 of [PLAN.md](PLAN.md). In Phase 1 every core expands its head's K itself; in Phase 2 the
+two cores of each head pair split the expansion and exchange their halves. Branch
 `pjosipovic/unrolled-v-tp-sharded-kv`. Last updated 2026-10-18. Everything was measured on one Blackhole Galaxy 8×4
 (TorusXY, high-power host). The feature is off by default: `PREFILL_MLA_EXPANDED_K=1` turns it on.
 
@@ -24,16 +25,28 @@ The rest of the change:
 - **Chunks:** K3 runs q320 / k256 in 2 K-split bands (k512 does not fit L1 beside the expanded K^T CB); K2.7 runs
   q320 / k256 in 3 bands (unchanged).
 
+**Phase 2, head groups:**
+- **When it applies:** with one Q chunk per core, per-head V chains, batch 1 and two Q chunks per head (both table
+  schedules), the two cores of each (K-split band, head) form a pair.
+- **What each core does:** it expands 2 of the 4 no-PE tile rows of every K chunk, with only those rows of W_UK
+  resident. It packs them both into its K^T chunk and into `cb_kexp_own`.
+- **The exchange:** the reader sends `cb_kexp_own` to the peer's `cb_kexp_peer` slot: a credit first (its own slot is
+  free), then the NoC write, then the data count. It hands the peer's rows to compute, which copies them into the
+  remaining rows.
+- **Causal skips:** a core expands and exchanges every chunk the reader delivers, including chunks its own Q chunk
+  then skips as fully masked, since the peer needs them.
+- **Unchanged:** the factory's `head_segments` are the pairs. Any other schedule keeps Phase 1.
+
 ## Exit criteria (PLAN.md §0)
 
 | | Criterion | Status | Evidence |
 |---|---|---|---|
-| E1 | Op correctness vs un-absorbed reference | ◐ | `test_ring_joint_expanded_k_per_head_vs_reference`: one chunk at position 0, full or valid-rows-only (2560 tokens; at position 0 this adds the unwritten pad rows, not partial-chunk masking) × `sp_only` / `tp_sharded` (single-slot K) × scalar / metadata × K2.7 / K3 × absorbed / expanded. The SDPA output per (query chip, head) is compared with fp32 attention on its own inputs: 32/32, min PCC 0.99951 (gate 0.999), max abs error ≤ 0.053, finite. Rotated starts and cache-hit sequences are checked only against absorbed on the device: per (device, head) PCC ≥ 0.99962 over rotated, multi-user and partial scenarios and forced schedules. Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights` |
-| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
-| E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k | ◐ | K2.7 256k −16.3%, K2.7 50k −14.1%, K3 50k −12.5%, K3 512k −14.6% (just under 15%: Phase 2) |
-| E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet |
+| E1 | Op correctness vs un-absorbed reference | ◐ | `test_ring_joint_expanded_k_per_head_vs_reference`: one chunk at position 0, full or valid-rows-only (2560 tokens; at position 0 this adds the unwritten pad rows, not partial-chunk masking) × `sp_only` / `tp_sharded` (single-slot K) × scalar / metadata × K2.7 / K3 × absorbed / expanded. The SDPA output per (query chip, head) is compared with fp32 attention on its own inputs: 32/32, min PCC 0.99951 (gate 0.999), max abs error ≤ 0.053, finite. Rotated starts and cache-hit sequences are checked only against absorbed on the device: per (device, head) PCC ≥ 0.99962 over rotated, multi-user and partial scenarios and forced schedules. Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights` Phase 2 (pairs exchanging rows): E1 32/32, per (device, head) vs absorbed ≥ 0.99968 over 40 runs, schedules 16/16, distinct weights 2/2 |
+| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet Phase 2: X2 `expanded_k` bitwise `tp_sharded` == `sp_only` 36/36 (rot, maxedge, fullchunk) |
+| E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k | ✅ | Phase 2, steady-state traced, `sp_only` vs absorbed: K3 512k −23.8%, K2.7 256k −25.1%, K3 50k −20.7%, K2.7 50k −22.7%; `tp_sharded` with the prefetch is within ±1% of `sp_only` (table below). One run each |
+| E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet Phase 2: X4 4/4 with allocation tracking |
 | E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 `absorbed` passes (with per-layer weight scaling added for E4) |
-| E6 | Two reviews per commit | ◐ | Phase 1 (`c19695fd7b5`) reviewed by both, no blocker ([log](reviews/c19695fd7b5.md)); the fix commit is pending review |
+| E6 | Two reviews per commit | ◐ | Phase 1 and its six review rounds reviewed by both, no open blocker or major (`reviews/`). The Phase 2 commit is pending review |
 
 ## Accuracy (E2)
 
@@ -50,12 +63,23 @@ PCC vs the CPU reference, from the harness's own check:
 
 Traced replays of a steady-state layer (layer 1 of 3), the parent plan's X5 method, `sp_only` layout. One run each.
 
-| Point | Absorbed (unrolled-V) | Expanded K, Phase 1 | Change | main `ring_mla` |
-|---|---|---|---|---|
-| K3 50k | 7.582 ms | 6.630 ms | −12.5% | 10.33 ms |
-| K3 512k | 61.779 ms | 52.745 ms | −14.6% | 89.61 ms |
-| K2.7 50k | 5.467 ms | 4.689 ms | −14.1% | 6.83 ms |
-| K2.7 256k | 22.127 ms | 18.519 ms | −16.3% | 29.46 ms |
+| Point | Absorbed (unrolled-V) | Expanded K, Phase 1 | Expanded K, Phase 2 | Phase 2 vs absorbed | main `ring_mla` |
+|---|---|---|---|---|---|
+| K3 50k | 7.582 ms | 6.630 ms | 6.014 ms | −20.7% | 10.33 ms |
+| K3 512k | 61.779 ms | 52.745 ms | 47.063 ms | −23.8% | 89.61 ms |
+| K2.7 50k | 5.467 ms | 4.689 ms | 4.227 ms | −22.7% | 6.83 ms |
+| K2.7 256k | 22.127 ms | 18.519 ms | 16.579 ms | −25.1% | 29.46 ms |
+
+**Phase 2, `tp_sharded` with the prefetch** (overhead vs its own `sp_only`):
+
+| Point | Time | Overhead |
+|---|---|---|
+| K3 50k | 6.054 ms | +0.66% |
+| K3 512k | 46.851 ms | −0.45% |
+| K2.7 50k | 4.210 ms | −0.39% |
+| K2.7 256k | 16.404 ms | −1.06% |
+
+Against main's `ring_mla`, the K3 512k forward is now 47% faster.
 
 **`tp_sharded`** with the prefetch: K3 512k 52.822 ms, K2.7 256k 18.329 ms.
 
@@ -88,18 +112,16 @@ schedule:
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
 
-**Proposed waiver (2026-10-18), awaiting the author's confirmation:** skip Phase 1's stop criterion (expansion
-≥ 60% of QK's MAC throughput); it is neither passed nor failed.
-- **What the floor guards:** per PLAN §0, 60% is the throughput at which the projected SDPA saving (≈ 26% of the
-  SDPA) still clears E3. E3 is measured on the whole MLA forward and is not yet met: K3 512k is at −14.6% against 15%.
-- **Why skip it:** Phase 2 (head groups) halves the expansion, and the waiver pulls E3's measurement forward from
-  Phase 3 to the end of Phase 2. If E3 still doesn't clear, the criterion applies again and the plan is re-examined
-  before Phase 3.
+**Phase 1's throughput stop criterion: moot.**
+- The proposed waiver (author to confirm) pulled E3's measurement to the end of Phase 2.
+- E3 is met there at all four points (−20.7% to −25.1%), so the question the 60% floor stood for (whether the
+  expansion pays enough to clear E3) is answered directly.
 
 ## Next steps
 
-1. Review the Phase 1 fix commit (E6).
-2. E4: trace the prefetch-off case too.
-3. Phase 2, the head-group exchange (PLAN.md §3.4): removes the remaining 2× redundant expansion, which is the path
-   to ≥ 15% at K3 512k. Then a chunk retune.
-4. Model-level runs with weights (golden trace, transformer tests) with `PREFILL_MLA_EXPANDED_K=1`.
+1. Review the Phase 2 commit (E6).
+2. E1: an fp32 reference for rotated starts and short → long → short sequences (today checked only against absorbed).
+3. E4: trace the prefetch-off case too.
+4. Phase 3: chunk retune for the expanded kernel; head groups of 4 (other schedules); model-level runs with weights
+   (golden trace, transformer tests) with `PREFILL_MLA_EXPANDED_K=1`.
+5. Phase 4: default on for Kimi (E5 regression set), docs.
