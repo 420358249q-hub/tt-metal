@@ -592,13 +592,15 @@ def _weights_digest(key, weights):
     for name in sorted(weights):
         t = weights[name]
         key.update(f"{name}{tuple(t.shape)}{t.dtype}".encode())
-        key.update(t.float().flatten()[:: max(1, t.numel() // 4096)].numpy().tobytes())
+        key.update(t.flatten()[:: max(1, t.numel() // 4096)].float().numpy().tobytes())
 
 
 def _test_weight_cache_dir(weights, mesh_device):
     """Opt-in (MLA_TEST_WEIGHT_CACHE=<dir>) on-disk cache of the converted MLA weights, so repeated local runs skip the
-    host-side conversion (about 2 minutes per K3 build). Keyed by the weights' values, the mesh shape and the
-    conversion code, so a changed seed, mesh or converter never reads a stale entry. Off (None) by default and in CI."""
+    host-side conversion (about 2 minutes per K3 build). Keyed by the weights' values, the mesh shape and
+    ttMLA._convert_and_cache_weights' source; the harness's fixed axes / layer index and ttnn's packing are not keyed,
+    so clear the directory after changing those. Off (None) by default and in CI. (cpu_mla_reference already caches
+    its outputs on disk: MLA_CHUNKED_REF_CACHE.)"""
     root = os.getenv("MLA_TEST_WEIGHT_CACHE")
     if not root:
         return None
@@ -609,31 +611,6 @@ def _test_weight_cache_dir(weights, mesh_device):
     path = Path(root) / key.hexdigest()[:16]
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def _cached_cpu_mla_reference(config, weights, hidden):
-    """cpu_mla_reference, with an opt-in (MLA_TEST_REF_CACHE=<dir>) on-disk cache: the K3 50k scenarios spend about 8
-    minutes each in the torch reference. Keyed by the reference module's source, the config, the weights and the full
-    input, so any change recomputes. Off by default and in CI."""
-    root = os.getenv("MLA_TEST_REF_CACHE")
-    if not root:
-        return cpu_mla_reference(config, weights, hidden)
-    key = hashlib.sha1()
-    key.update(Path(inspect.getsourcefile(cpu_mla_reference)).read_bytes())
-    key.update(repr(sorted((k, repr(v)) for k, v in vars(config).items() if k != "max_seq_len")).encode())
-    _weights_digest(key, weights)
-    key.update(repr(tuple(hidden.shape)).encode())
-    key.update(hidden.view(torch.int16).numpy().tobytes())
-    path = Path(root) / f"{key.hexdigest()[:20]}.pt"
-    if path.exists():
-        cached = torch.load(path, weights_only=True)
-        return cached["ref_out"], cached["ref_kvpe"]
-    ref_out, ref_kvpe = cpu_mla_reference(config, weights, hidden)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    torch.save({"ref_out": ref_out, "ref_kvpe": ref_kvpe}, tmp)
-    tmp.rename(path)
-    return ref_out, ref_kvpe
 
 
 def _run_chunked_prefill(
@@ -778,7 +755,7 @@ def _run_chunked_prefill(
         elif reference == "cpu":
             torch.manual_seed(42 + u)
             hidden = torch.randn(total_len, hidden_size, dtype=torch.bfloat16)
-            ref_out, ref_kvpe = _cached_cpu_mla_reference(config, weights, hidden)
+            ref_out, ref_kvpe = cpu_mla_reference(config, weights, hidden)
         else:  # None -> functional / perf, no reference
             torch.manual_seed(100 + u)
             hidden = torch.randn(total_len, hidden_size, dtype=torch.bfloat16)
