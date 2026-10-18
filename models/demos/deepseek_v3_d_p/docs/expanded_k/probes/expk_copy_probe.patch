@@ -1,5 +1,5 @@
 diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
-index 404d19ee0f5..ab3f0a1cff9 100644
+index 404d19e..fc8847d 100644
 --- a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
 +++ b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
 @@ -1468,6 +1468,8 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
@@ -11,7 +11,7 @@ index 404d19ee0f5..ab3f0a1cff9 100644
      reconfig_data_format_srca(cb_wuk, cb_kt_in);
      copy_init(cb_kt_in);
      for (uint32_t p = 0; p < pe_rows; ++p) {
-@@ -1480,13 +1482,18 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
+@@ -1480,13 +1482,19 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
              tile_regs_release();
          }
      }
@@ -26,7 +26,16 @@ index 404d19ee0f5..ab3f0a1cff9 100644
 +        DeviceZoneScopedSumN2("EXPK-WAIT");
          CircularBuffer(cb_peer).wait_front(own_rows * Sk_chunk_t);
 +        }
++        {
 +        DeviceZoneScopedSumN1("EXPK-CP");
          reconfig_data_format_srca(cb_kt_in, cb_peer);
          copy_init(cb_peer);
          for (uint32_t r = 0; r < own_rows; ++r) {
+@@ -1499,6 +1507,7 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
+                 tile_regs_release();
+             }
+         }
++        }
+         sdpa_cb_pop_front_out_of_line(cb_peer, own_rows * Sk_chunk_t);
+     }
+     CircularBuffer(cb_kexp).push_back(DHt_qk * Sk_chunk_t);

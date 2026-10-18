@@ -165,8 +165,8 @@ Measured at the author's request, as input for optimisation, not as a gate.
     the scattered single-tile packs; closing it needs unpack-side instrumentation.
   - The same blocks on SDPA's no-MOP matmul (`sdpa_mm_init` / `sdpa_matmul_block_no_mop`, as QK and PV use) were
     no faster: 39.1 (K3) and 43.3 (K2.7) cycles per tile.
-- **The copies around the expansion cost about as much as the matmul's gap to QK** (more at K3, slightly less at
-  K2.7).
+- **The copies around the expansion cost about as much as the matmul's gap to QK** (slightly less at K2.7, where
+  the copies were split out; at K3 only the whole-minus-matmul difference was measured).
   - The whole of `sdpa_expand_k_chunk` takes 22.9% (K3 512k) and 24.2% (K2.7 256k) of the SDPA kernel, against 18.0%
     and 19.5% for its matmul loop alone. Measured on the no-MOP blocked version.
   - A split on the committed kernel (K2.7 256k) puts the k_pe and peer-row copies at 4.3% of the kernel (math
@@ -187,13 +187,12 @@ Measured at the author's request, as input for optimisation, not as a gate.
   - Groups of 4 (each core expands 1 of 4 no-PE rows). This halves the per-core expansion again (≈ 7–10% of the
     kernel at best), on schedules with 4 Q-chunk cores per head. But the kernel supports pairs only, the wider
     exchange is not costed, and K3's 4-core schedule was 11.5% slower in Phase 1.
-- **Not covered** by the zones above: stalls outside them. The kernel times here come from one
-  eager, profiled layer (42.48 / 14.46 ms); E3's 42.35 / 14.74 ms are realtime-profiler times from traced
-  steady-state runs.
+- **Not covered** by the zones above: stalls outside them. The kernel times here come from one eager, profiled layer
+  (42.48 / 14.46 ms); E3's 42.35 / 14.74 ms are realtime-profiler times from traced steady-state runs.
 - **Reproduce:** `probes/` holds the probe patches (`expk_util_probe.patch` for the matmul and QK zones,
-  `expk_copy_probe.patch` for the copy and peer-wait zones, with `expk_copy_analyze.py`), the harness (its header has
-  the exact commands; one case per run)
-  and the analysis script (`expk_util_analyze.py profile_log_device.csv`).
+  `expk_copy_probe.patch` for the copy and peer-wait zones), the harness (its header has the exact commands; one case
+  per run) and the analysis scripts (`expk_util_analyze.py`, `expk_copy_analyze.py`, each on
+  `profile_log_device.csv`).
 
 ## Next steps
 
