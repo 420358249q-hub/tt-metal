@@ -190,9 +190,9 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
 8. **SP ring K+V gather: where the limit is (measured 2026-10-18).** Expanded KV, KV 512k, TorusXY, `sp_only`.
    - **Ethernet floor.** Each chip receives 7 of 8 shards at 100 GB/s ingress (4 links × 25 GB/s). Per token: bfp8 K
      latent (576) + per-head V (heads × 128), 1,088 B per 1,024-value tile: 3,876 B for K3, 2,788 B for K2.7. Floor:
-     17.8 ms (K3), 12.8 ms (K2.7). Measured gather alone: 22.6 / 16.3 ms, about 78% of the floor. The fused gather
-     already splits the diametric shard between the two ring directions (`ring_joint_sdpa_program_factory.cpp`, split
-     forwarding), so direction imbalance is not the gap.
+     17.8 ms (K3), 12.8 ms (K2.7). Measured gather alone: 22.6 / 16.3 ms, 78–79% of the floor. With unrolled V the
+     fused gather already splits the diametric shard between the two ring directions
+     (`ring_joint_sdpa_program_factory.cpp`, split forwarding; off for latent V), so direction imbalance is not the gap.
    - **Chunk size decides the bound, not KV length.** Both compute and the gather grow linearly with KV length.
      - At 5k chunks the SDPA is compute-bound: the gather alone is 53–57% of the SDPA program at HiFi2, 65–69% at
        LoFi.
