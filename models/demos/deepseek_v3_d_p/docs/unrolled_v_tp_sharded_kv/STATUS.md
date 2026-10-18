@@ -182,3 +182,7 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
    - `high_bw_all_gather` `outer_block_rows` (useful on its own);
    - the review findings on PR #59531 itself, which are not this branch's code: sparse `tp_shard_kv=False` must be
      rejected, and `zero_padded_kv_cache` with `tp_axis` has no op test.
+7. **TODO: remove the split-KV SDPA code from PR #58613** (PLAN.md §9). This branch's TP latent gather replaces it,
+   and nothing in production reaches it any more. The snake gather stays. It is a separate cleanup PR against `main`,
+   agreed with skrsticTT and landed after this branch. The one change for this branch is the stale `ring_mla` comment in
+   the K2.7 adapter.
