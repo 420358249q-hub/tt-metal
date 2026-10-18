@@ -169,6 +169,19 @@ class CCLManager:
         self._barrier_idx = (self._barrier_idx + 1) % 2
         return sem
 
+    def get_all_reduce_semaphores(self):
+        """(barrier pair, rs triple, ag triple) for ``all_reduce_async``.
+
+        All of them were created in ``__init__``, before any trace capture, so the collective
+        allocates no semaphore of its own at call time: ``ttnn.all_reduce`` creates fresh ones per
+        cached program, and a program first compiled after a decode trace capture would put them
+        in the worker L1 the replay overwrites.
+        """
+        # The reduce-scatter half takes three semaphores, the default all-gather
+        # implementation exactly two (the manager's gather pool holds three for
+        # the async path's sharded variant).
+        return list(self._barrier_semaphores), self.get_rs_semaphore(), self.get_ag_semaphore()[:2]
+
     def _shape_key(self, shape, dtype, memory_config, axis=None):
         # axis distinguishes same-shape buffers used by collectives on different
         # cluster axes (per-device shard layout differs even when shapes match).
@@ -243,6 +256,37 @@ class CCLManager:
         return [inter, out]
 
 
+_L1_SMALL_SEMAPHORES: dict = {}
+
+
+def ccl_semaphores_in_l1_small(mesh_device) -> bool:
+    """True when the mesh was opened with an L1_SMALL region (``l1_small_size`` > 0).
+
+    The generic collectives (``ttnn.reduce_scatter`` / ``ttnn.all_gather``) allocate their global
+    semaphores once per cached program, i.e. on the first call of a new shape. With no L1_SMALL region
+    they land in worker L1, top-down -- the same addresses a previously captured decode trace used for
+    its L1 intermediates -- and the next trace replay overwrites them (observed as a wrong first token
+    or a hang on the prefill that follows the first traced decode). With a region they go to L1_SMALL,
+    which traced ops never touch. ``ttnn.all_gather`` switches on its own; ``ttnn.reduce_scatter``
+    needs the flag, and the all-reduce goes through ``sync_all_reduce`` with the manager's
+    pre-created semaphores.
+    """
+    key = id(mesh_device)
+    if key not in _L1_SMALL_SEMAPHORES:
+        try:
+            view = ttnn.get_memory_view(mesh_device, ttnn.BufferType.L1_SMALL)
+            _L1_SMALL_SEMAPHORES[key] = int(view.total_bytes_per_bank) > 0
+        except Exception as e:  # noqa: BLE001 - absent view means no region
+            logger.warning(f"Gemma4 CCL: could not query L1_SMALL ({e}); semaphores stay in L1")
+            _L1_SMALL_SEMAPHORES[key] = False
+        if not _L1_SMALL_SEMAPHORES[key]:
+            logger.warning(
+                "Gemma4 CCL: mesh has no L1_SMALL region; collective semaphores created after a trace capture "
+                "can be overwritten by replays (open the mesh with l1_small_size, e.g. 65536)"
+            )
+    return _L1_SMALL_SEMAPHORES[key]
+
+
 def ccl_allreduce(tensor, mesh_config, ccl_manager, memory_config=None, axis=None, group_size=None):
     """All-reduce across TP devices.
 
@@ -303,15 +347,32 @@ def ccl_allreduce(tensor, mesh_config, ccl_manager, memory_config=None, axis=Non
             scattered.deallocate(True)
         return gathered
 
-    # Sync all_reduce: omit deprecated num_links/topology (Sep-2026 removal);
-    # Fabric / cluster_axis supply those defaults (same as sync all_gather).
-    result = ttnn.all_reduce(
-        tensor,
-        cluster_axis=tp_axis,
-        memory_config=memory_config,
-    )
+    result = sync_all_reduce(tensor, tp_axis, memory_config, ccl_manager)
     tensor.deallocate(True)
     return result
+
+
+def sync_all_reduce(tensor, axis, memory_config, ccl_manager=None):
+    """Synchronous all-reduce over ``axis``; with a manager, through ``all_reduce_async`` on the
+    manager's pre-created semaphores (the same op ``ttnn.all_reduce`` runs, which would otherwise
+    create its semaphores per cached program -- in worker L1 when the program is first compiled
+    after a decode trace capture, where the replay overwrites them; see
+    ``ccl_semaphores_in_l1_small``). Without a manager: ``ttnn.all_reduce``."""
+    memory_config = memory_config or ttnn.DRAM_MEMORY_CONFIG
+    if ccl_manager is None:
+        return ttnn.all_reduce(tensor, cluster_axis=axis, memory_config=memory_config)
+    barriers, rs_sems, ag_sems = ccl_manager.get_all_reduce_semaphores()
+    return ttnn.experimental.all_reduce_async(
+        tensor,
+        cluster_axis=axis,
+        mesh_device=ccl_manager.mesh_device,
+        barrier_semaphores=barriers,
+        rs_global_semaphores=rs_sems,
+        ag_global_semaphores=ag_sems,
+        math_op=ttnn.ReduceType.Sum,
+        memory_config=memory_config,
+        topology=ccl_manager.topology,
+    )
 
 
 def ccl_allreduce_fractured(tensor, mesh_config, ccl_manager, memory_config=None):
@@ -337,7 +398,7 @@ def ccl_allreduce_fractured(tensor, mesh_config, ccl_manager, memory_config=None
                 group_size=mesh_config.mesh_shape[axis],
             )
         else:
-            reduced = ttnn.all_reduce(out, cluster_axis=axis, memory_config=memory_config)
+            reduced = sync_all_reduce(out, axis, memory_config, ccl_manager)
             out.deallocate(True)
             out = reduced
     return out
@@ -353,7 +414,7 @@ def ccl_lane_gather_rows(tensor, mesh_config, memory_config=None):
     return gathered
 
 
-def ccl_lane_scatter_rows(tensor, mesh_config, memory_config=None):
+def ccl_lane_scatter_rows(tensor, mesh_config, memory_config=None, ccl_manager=None):
     """Complete a lane-sharded fractured matmul: reduce_scatter rows to their lanes, then all-reduce over tp.
 
     reduce_scatter sums the cross-lane K-chunks; the tp-axis all-reduce sums the within-column chunks.
@@ -361,9 +422,15 @@ def ccl_lane_scatter_rows(tensor, mesh_config, memory_config=None):
     if mesh_config is None or not getattr(mesh_config, "lane_sharded", False):
         return tensor
     memory_config = memory_config or ttnn.DRAM_MEMORY_CONFIG
-    scattered = ttnn.reduce_scatter(tensor, dim=2, cluster_axis=mesh_config.sp_axis, memory_config=memory_config)
+    scattered = ttnn.reduce_scatter(
+        tensor,
+        dim=2,
+        cluster_axis=mesh_config.sp_axis,
+        memory_config=memory_config,
+        use_l1_small_for_semaphores=ccl_semaphores_in_l1_small(tensor.device()),
+    )
     tensor.deallocate(True)
-    reduced = ttnn.all_reduce(scattered, cluster_axis=mesh_config.tp_axis, memory_config=memory_config)
+    reduced = sync_all_reduce(scattered, mesh_config.tp_axis, memory_config, ccl_manager)
     scattered.deallocate(True)
     return reduced
 
