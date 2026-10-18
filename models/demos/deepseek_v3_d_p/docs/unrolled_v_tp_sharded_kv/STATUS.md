@@ -187,3 +187,22 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
    and nothing in production reaches it any more. The snake gather stays. It is a separate cleanup PR against `main`,
    agreed with skrsticTT and landed after this branch. The one change for this branch is the stale `ring_mla` comment in
    the K2.7 adapter.
+8. **SP ring K+V gather: where the limit is (measured 2026-10-18).** Expanded KV, KV 512k, TorusXY, `sp_only`.
+   - **Ethernet floor.** Each chip receives 7 of 8 shards at 100 GB/s ingress (4 links × 25 GB/s). Per token: bfp8 K
+     latent (576) + per-head V (heads × 128): 3,876 B for K3, 2,788 B for K2.7. Floor 17.8 ms for K3 and 12.8 ms for
+     K2.7. Measured gather alone: 22.6 / 16.3 ms, about 79% of the floor.
+   - **Chunk size decides the bound, not KV length.** Both compute and the gather grow linearly with KV length. At 5k
+     chunks the SDPA is compute-bound: the gather alone is 53–57% of the SDPA program at HiFi2 and 65–69% at LoFi. At
+     2k it is gather-bound: 89–94%, and LoFi saves only 3–5%. Break-even is about 2.7k (HiFi2) to 3.3k (LoFi) tokens
+     per chunk.
+   - **Placement and NoCs: tried and rejected.** Ring CCL workers on logical row 0 (next to the ethernet row), with the
+     gather swapped to reads on NoC0 and push on NoC1. Branch `pjosipovic/ccl-row0`, local only. Today's layout
+     (column 11, reads on NoC1, push on NoC0) was fastest at every point (2×2 A/B, LoFi and HiFi2):
+     - the NoC swap costs 23–27% at 2k, because the gather's DRAM reads compete with the SDPA reader on NoC0;
+     - row 0 alone costs 7–12%.
+   - **Levers left.**
+     - The ~20% gap to the floor: split each shard across both ring directions (today 4 / 3 whole shards), and size
+       the fabric packets for the gather's 2 KB pages.
+     - Fewer bytes: gather only the latent and expand V on arrival, about 6× fewer bytes, which makes 2k chunks
+       compute-bound.
+     - More links: only 2 of the 4 ethernet channels per direction have routing planes.
