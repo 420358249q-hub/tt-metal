@@ -165,14 +165,16 @@ Measured at the author's request, as input for optimisation, not as a gate.
     the scattered single-tile packs; closing it needs unpack-side instrumentation.
   - The same blocks on SDPA's no-MOP matmul (`sdpa_mm_init` / `sdpa_matmul_block_no_mop`, as QK and PV use) were
     no faster: 39.1 (K3) and 43.3 (K2.7) cycles per tile.
-- **The copies around the expansion cost more than the matmul's gap to QK.**
+- **The copies around the expansion cost about as much as the matmul's gap to QK** (more at K3, slightly less at
+  K2.7).
   - The whole of `sdpa_expand_k_chunk` takes 22.9% (K3 512k) and 24.2% (K2.7 256k) of the SDPA kernel, against 18.0%
     and 19.5% for its matmul loop alone. Measured on the no-MOP blocked version.
   - A split on the committed kernel (K2.7 256k) puts the k_pe and peer-row copies at 4.3% of the kernel (math
-    thread). Waiting for the peer's rows is ≈ 0%.
+    thread). Waiting for the peer's rows is < 1% (unpack thread). The whole-minus-matmul difference above (4.7% at
+    K2.7, 4.9% at K3) also holds inits, reconfigs and that wait, on the no-MOP kernel.
   - That is 32 tile copies per K chunk against 256 tile matmuls, so each copy costs about 1.8 matmul tiles. Each
-    `copy_tile` runs its own acquire / commit / wait / pack / release, so the unpack, math and pack stages never
-    overlap.
+    `copy_tile` pays a full DST handshake and a packer address programming of its own (a hypothesis, not yet
+    isolated).
   - Levers, smallest first:
     - Batch the copies, up to 8 tiles per DST acquire.
     - Expand in place: pack the no-PE rows next to k_pe in the latent chunk through an alias CB, so the QK reads
@@ -185,10 +187,12 @@ Measured at the author's request, as input for optimisation, not as a gate.
   - Groups of 4 (each core expands 1 of 4 no-PE rows). This halves the per-core expansion again (≈ 7–10% of the
     kernel at best), on schedules with 4 Q-chunk cores per head. But the kernel supports pairs only, the wider
     exchange is not costed, and K3's 4-core schedule was 11.5% slower in Phase 1.
-- **Not covered:** the k_pe and peer-row copies, and stalls outside the zones. The kernel times here come from one
+- **Not covered** by the zones above: stalls outside them. The kernel times here come from one
   eager, profiled layer (42.48 / 14.46 ms); E3's 42.35 / 14.74 ms are realtime-profiler times from traced
   steady-state runs.
-- **Reproduce:** `probes/` holds the probe patch, the harness (its header has the exact commands; one case per run)
+- **Reproduce:** `probes/` holds the probe patches (`expk_util_probe.patch` for the matmul and QK zones,
+  `expk_copy_probe.patch` for the copy and peer-wait zones, with `expk_copy_analyze.py`), the harness (its header has
+  the exact commands; one case per run)
   and the analysis script (`expk_util_analyze.py profile_log_device.csv`).
 
 ## Next steps
