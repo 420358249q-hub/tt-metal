@@ -180,8 +180,8 @@ Measured at the author's request, as input for optimisation, not as a gate.
    (worst layer 0.98587, bar 0.98): it runs non-chunked attention, which expanded K does not touch.
    **Head groups of 4: dropped (author, 2026-10-18).** Today's schedules use pairs, and groups of 4 would only help
    4-Q-chunk-per-head schedules that neither Kimi model runs.
-5. Phase 4 (open until E5 passes): **default on for Kimi** (author, 2026-10-18), with 2k-chunk schedules (K3 q128 / k256 / 2, K2.7 q128 / k256
-   / 3, from a 512k HiFi2 sweep). Still to do: the E5 regression set on the new default.
+5. Phase 4 (open until E5 passes): **default on for Kimi** (author, 2026-10-18), with 2k-chunk schedules from a 512k
+   HiFi2 sweep (K3 q128 / k256 / 2, K2.7 q128 / k256 / 3). Still to do: the E5 regression set on the new default.
 6. The unrolled-V accuracy gap against main's `ring_mla` (0.001 on K2.7 to 0.005 on K3, found in the perf matrix) is
    fixed in `71e49173813`: the V expansion accumulates in fp32 at HiFi4. CPU reference, 10k prefix + two 5k chunks,
    HiFi2 SDPA: K3 0.99322 → 0.99826 (expanded K 0.99828; main 0.99805), K2.7 0.99637 → 0.99749 (main 0.99738). The

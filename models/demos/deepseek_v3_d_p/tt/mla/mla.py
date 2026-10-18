@@ -561,7 +561,7 @@ class ttMLA:
             # the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked unrolled-V only. On by
             # default wherever a measured schedule exists (Kimi K2.7 / K3); PREFILL_MLA_EXPANDED_K=0 (or false / off)
             # turns it off, =1 also warns when it cannot apply.
-            expanded_k_mode = os.getenv("PREFILL_MLA_EXPANDED_K")
+            expanded_k_mode = (os.getenv("PREFILL_MLA_EXPANDED_K") or "").lower() or None
             if self.is_chunked and not self._has_indexer and expanded_k_mode not in ("0", "false", "off"):
                 self._expanded_k = self._expanded_k_supported(warn=expanded_k_mode == "1")
             if self.is_chunked and not self._has_indexer:

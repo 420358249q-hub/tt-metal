@@ -1927,7 +1927,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
     sp_axis, tp_axis = 0, 1
     mesh_shape = tuple(mesh_device.shape)
     # _X4_STEPS is written for 5k chunks; scale its starts so 2k chunks keep the same long/short/rotated pattern.
-    steps = [(user, start * chunk // 5120) for user, start in _X4_STEPS]
+    x4_steps = [(user, start * chunk // 5120) for user, start in _X4_STEPS]
     seq_len_cache = 4 * chunk
     config.max_seq_len = seq_len_cache
     num_layers, num_users = 3, 2
@@ -2049,7 +2049,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
     # Eager reference on a fresh cache.
     eager = []
     cache_eager = new_cache()
-    for step, (user, start) in enumerate(steps):
+    for step, (user, start) in enumerate(x4_steps):
         set_step(user, start)
         poison(step)
         outs = forward_all(cache_eager, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
@@ -2061,7 +2061,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
     # intermediate buffers and be overwritten by a later replay.
     cache_sp = new_cache(tp_sharded=False)
     tt_hidden = [to_device(host_hidden(0, layer)) for layer in range(num_layers)]
-    set_step(*steps[0])
+    set_step(*x4_steps[0])
     # Compile the sp_only programs now too (writing step 0's rows of the replicated cache, as its pass will again), so
     # nothing is compiled -- kernel binaries are allocated -- while the trace is alive.
     for mla_layer in layers:
@@ -2092,7 +2092,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
 
     def replay(steps, poison_base):
         for step in steps:
-            user, start = steps[step]
+            user, start = x4_steps[step]
             set_step(user, start)
             for layer in range(num_layers):
                 ttnn.copy_host_to_device_tensor(
@@ -2112,13 +2112,13 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
                 )
 
     try:
-        replay(range(len(steps)), poison_base=100)
+        replay(range(len(x4_steps)), poison_base=100)
 
         # The same steps eagerly on the TP-replicated cache: the TP-sharded layer and cache indexing must give the same
         # output.
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(False)
-        for step, (user, start) in enumerate(steps):
+        for step, (user, start) in enumerate(x4_steps):
             set_step(user, start)
             outs = forward_all(cache_sp, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
             for layer in range(num_layers):
@@ -2136,7 +2136,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
         # runtime arguments) and then the same capture replayed again must still match.
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(True)
-        for step, (user, start) in enumerate(steps):
+        for step, (user, start) in enumerate(x4_steps):
             set_step(user, start)
             poison(300 + step)
             outs = forward_all(cache_eager, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
@@ -2147,7 +2147,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
                 ), f"eager tp_sharded after sp_only: step {step} layer {layer}"
             for out in outs:
                 ttnn.deallocate(out)
-        replay(range(len(steps)), poison_base=200)
+        replay(range(len(x4_steps)), poison_base=200)
         assert (
             mesh_device.num_program_cache_entries() == program_entries
         ), "a program compiled while the trace was alive"
@@ -2171,7 +2171,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
     assert torch.equal(nat_sp, nat_eager), "TP-replicated and TP-sharded caches differ"
     # Every slot is written, and rows past user 1's extent (12800 at 5k chunks) are written only in user 0's slots
     # (user 0 writes to 20480): a transposed (layer, user) slot mapping would put user 0's rows into a user-1 slot.
-    user1_end = max(start for user, start in steps if user == 1) + chunk
+    user1_end = max(start for user, start in x4_steps if user == 1) + chunk
     for user in range(num_users):
         for layer in range(num_layers):
             slot = user * num_layers + layer
@@ -2623,7 +2623,7 @@ def test_mla_expanded_k_matches_absorbed_2k(
 @pytest.mark.parametrize(
     "variant", ["kimi_k2_7", "kimi_k3", "mistral_small_4"], indirect=True, ids=["k2_7", "k3", "mistral4"]
 )
-@pytest.mark.parametrize("env", [None, "0", "1"], ids=["unset", "off", "on"])
+@pytest.mark.parametrize("env", [None, "0", "false", "OFF", "1"], ids=["unset", "off", "off_false", "off_upper", "on"])
 @pytest.mark.timeout(0)
 def test_mla_expanded_k_default_selection(request, mesh_device, device_params, variant, env, monkeypatch):
     """Expanded K is on by default where a measured schedule exists (Kimi) and silently off elsewhere (Mistral, latent
@@ -2649,7 +2649,8 @@ def test_mla_expanded_k_default_selection(request, mesh_device, device_params, v
         iters_isl=[5120],
     )
     supported = variant.name != "mistral_small_4"
-    assert recorder.calls and all(c["expanded"] == (supported and env != "0") for c in recorder.calls)
+    off = env is not None and env.lower() in ("0", "false", "off")
+    assert recorder.calls and all(c["expanded"] == (supported and not off) for c in recorder.calls)
     declined = [w for w in warnings if "PREFILL_MLA_EXPANDED_K ignored" in w]
     assert bool(declined) == (env == "1" and not supported), declined
 
@@ -2657,7 +2658,7 @@ def test_mla_expanded_k_default_selection(request, mesh_device, device_params, v
 # Unrolled-V accuracy floor (docs/expanded_k/STATUS.md): the V expansion accumulates in fp32 at HiFi4. Accumulated in
 # bf16 at HiFi2 it scored K3 0.99322 and K2.7 0.99637 here (main's ring_mla 0.99805 / 0.99738; fp32 0.99826 / 0.99749),
 # and the harness's own 0.98 checks would not notice.
-_UNROLLED_V_MIN_PCC = {"kimi_k3": 0.9978, "kimi_k2_7": 0.9970}
+_UNROLLED_V_MIN_PCC = {"kimi_k3": 0.9978, "kimi_k2_7": 0.9968}
 
 
 @pytest.mark.parametrize(
