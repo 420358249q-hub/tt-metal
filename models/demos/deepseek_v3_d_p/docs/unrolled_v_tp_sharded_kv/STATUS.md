@@ -55,8 +55,9 @@ Milestone: Phases 2 and 3 of [PLAN.md](PLAN.md) (TP latent gather; prefetched du
 | `7e8c371d91f` | Phase 3 round-4: device check of a chain's stop layer | [log](reviews/7e8c371d91f.md) |
 | `c19695fd7b5` … | Expanded K on arrival, Phases 1 and 2, and their review rounds: tracked in [../expanded_k/STATUS.md](../expanded_k/STATUS.md), review logs in `../expanded_k/reviews/`. `c19695fd7b5` also added the stop-layer clamp check ([log](reviews/7e8c371d91f.md) finding 1) | see `../expanded_k/reviews/` |
 
-Each code commit up to `239b41cb8e5` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
-answered in its log.
+Every Phase 2 and Phase 3 code commit, through `7e8c371d91f`, was reviewed by Claude Code and Codex (gpt-6-astra);
+every finding is fixed or answered in its log. Expanded-K commits from `c19695fd7b5` on are reviewed and logged under
+`../expanded_k/reviews/` (that plan's E6).
 
 ## Exit criteria (PLAN.md §0)
 
@@ -70,7 +71,7 @@ answered in its log.
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities, net of both TP latent buffers: 0.645 GB (K3 512k), 0.886 GB (K2.7 256k) per user slot |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
 | X8 | Defaults and CI | ◐ | `sp_only` K3 50k is unchanged on the realtime profiler (7.654 / 7.660 ms vs 7.656 ms before). The criterion asks for a traced before/after, which was not measured: only the branch's traced `sp_only` (table below). **CI legs not run** (next step 3, deliberately out of this milestone). |
-| X9 | Two reviews per commit | ✅ | Every Phase 2 and Phase 3 commit reviewed by both, findings fixed or answered in `reviews/`; the Phase 3 rounds ended with `7e8c371d91f` (no blocker or major). Expanded-K commits are logged in `../expanded_k/reviews/` |
+| X9 | Two reviews per commit | ✅ | Scope: this plan's commits (Phases 2–3); expanded-K commits count under `../expanded_k/STATUS.md` E6, which includes the pending latest commit. Every Phase 2 and Phase 3 commit reviewed by both, findings fixed or answered in `reviews/`; the Phase 3 rounds ended with `7e8c371d91f` (no blocker or major). Expanded-K commits are logged in `../expanded_k/reviews/` |
 
 ### Performance (X5)
 
