@@ -189,20 +189,34 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
    the K2.7 adapter.
 8. **SP ring K+V gather: where the limit is (measured 2026-10-18).** Expanded KV, KV 512k, TorusXY, `sp_only`.
    - **Ethernet floor.** Each chip receives 7 of 8 shards at 100 GB/s ingress (4 links × 25 GB/s). Per token: bfp8 K
-     latent (576) + per-head V (heads × 128): 3,876 B for K3, 2,788 B for K2.7. Floor 17.8 ms for K3 and 12.8 ms for
-     K2.7. Measured gather alone: 22.6 / 16.3 ms, about 79% of the floor.
-   - **Chunk size decides the bound, not KV length.** Both compute and the gather grow linearly with KV length. At 5k
-     chunks the SDPA is compute-bound: the gather alone is 53–57% of the SDPA program at HiFi2 and 65–69% at LoFi. At
-     2k it is gather-bound: 89–94%, and LoFi saves only 3–5%. Break-even is about 2.7k (HiFi2) to 3.3k (LoFi) tokens
-     per chunk.
-   - **Placement and NoCs: tried and rejected.** Ring CCL workers on logical row 0 (next to the ethernet row), with the
-     gather swapped to reads on NoC0 and push on NoC1. Branch `pjosipovic/ccl-row0`, local only. Today's layout
-     (column 11, reads on NoC1, push on NoC0) was fastest at every point (2×2 A/B, LoFi and HiFi2):
-     - the NoC swap costs 23–27% at 2k, because the gather's DRAM reads compete with the SDPA reader on NoC0;
-     - row 0 alone costs 7–12%.
+     latent (576) + per-head V (heads × 128), 1,088 B per 1,024-value tile: 3,876 B for K3, 2,788 B for K2.7. Floor:
+     17.8 ms (K3), 12.8 ms (K2.7). Measured gather alone: 22.6 / 16.3 ms, about 78% of the floor. The fused gather
+     already splits the diametric shard between the two ring directions (`ring_joint_sdpa_program_factory.cpp`, split
+     forwarding), so direction imbalance is not the gap.
+   - **Chunk size decides the bound, not KV length.** Both compute and the gather grow linearly with KV length.
+     - At 5k chunks the SDPA is compute-bound: the gather alone is 53–57% of the SDPA program at HiFi2, 65–69% at
+       LoFi.
+     - At 2k it is gather-bound: 89–94%, and LoFi saves only 3–5%.
+     - Break-even is about 2.7–3.5k tokens per chunk (HiFi2 to LoFi, K3 to K2.7).
+   - **Placement and NoCs: tried and rejected.**
+     - **What was tried:** ring CCL workers on logical row 0 (next to the ethernet row) and/or the gather swapped to
+       DRAM reads on NoC0 and fabric push on NoC1. Local branch `pjosipovic/ccl-row0`: `a82f2af0cff` (layout),
+       `91b52089760` (`TT_RING_AG_SWAP_NOC` switch). Runner: `row0_noc_ab.sh` in the work directory.
+     - **Result:** today's layout (column 11, reads on NoC1, push on NoC0) was fastest at every point. The swap
+       costs 23–27% at 2k, because the gather's DRAM reads compete with the SDPA reader on NoC0. Row 0 alone costs
+       11–12% at 2k and 3–4% at 5k.
+
+     | Forward ms (row-0 build, V at HiFi4) | Column / original | Column / swap | Row 0 / original | Row 0 / swap |
+     |---|---|---|---|---|
+     | K3 2k LoFi | 27.85 | 35.28 | 31.29 | 34.77 |
+     | K3 5k LoFi | 39.38 | 41.49 | 40.83 | 41.51 |
+     | K2.7 2k LoFi | 19.54 | 24.86 | 21.79 | 24.30 |
+     | K2.7 5k LoFi | 26.59 | 28.63 | 27.40 | 27.99 |
+     | K3 2k HiFi2 | 29.42 | 36.28 | 32.73 | 35.86 |
+     | K2.7 2k HiFi2 | 20.23 | 25.46 | 22.65 | 24.93 |
    - **Levers left.**
-     - The ~20% gap to the floor: split each shard across both ring directions (today 4 / 3 whole shards), and size
-       the fabric packets for the gather's 2 KB pages.
-     - Fewer bytes: gather only the latent and expand V on arrival, about 6× fewer bytes, which makes 2k chunks
-       compute-bound.
+     - The ~22% gap to the floor: fabric packet payload vs the 1,088 B pages (a 7,168 B packet holds 6 pages,
+       14,400 B holds 13; measurement pending), and NoC contention with the SDPA.
+     - Fewer bytes: gather only the latent and expand V on arrival, 4.6× (K2.7) to 6.3× (K3) fewer bytes. That should
+       make 2k chunks compute-bound, at the cost of the per-head V expansion in compute.
      - More links: only 2 of the 4 ethernet channels per direction have routing planes.
