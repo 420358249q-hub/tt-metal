@@ -1329,7 +1329,10 @@ class ttMLA:
         the K/V sequence."""
         key = (self.kv_lora_rank + self.qk_rope_head_dim, num_local_heads, seq_len_local)
         if self._expanded_k:
-            # Validated at construction (_expanded_k_supported).
+            # Validated at construction (_expanded_k_supported) for the layer's active chunk.
+            assert (
+                key in self._EXPANDED_K_SDPA_CHUNKS
+            ), f"expanded K was enabled for {self.active_seq_len // self.sp_factor} local rows, got {key}"
             return self._EXPANDED_K_SDPA_CHUNKS[key]
         measured = self._UNROLLED_V_SDPA_CHUNKS.get(key)
         if measured is not None:

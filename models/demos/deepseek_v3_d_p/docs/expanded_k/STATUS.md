@@ -28,11 +28,11 @@ The rest of the change:
 
 | | Criterion | Status | Evidence |
 |---|---|---|---|
-| E1 | Op correctness vs un-absorbed reference | ◐ | Through MLA, on the table schedules and on forced ones (`test_mla_expanded_k_schedules`: q160/k256 with no K split, q64/k256 with 2–3 Q chunks per core; 16/16). Weight addresses on cache hits: `test_mla_expanded_k_distinct_layer_weights` (2/2, PCC ≥ 0.99972). A standalone op test against a torch un-absorbed reference is still to write |
-| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. Each passes the harness's CPU-reference check, and expanded vs absorbed is PCC ≥ 0.99979 (gate 0.999). `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
+| E1 | Op correctness vs un-absorbed reference | ✅ | `test_ring_joint_expanded_k_per_head_vs_reference` (K2.7 with 3 K-split bands, empty on chunk 0; K3; absorbed and expanded): SDPA output per head vs fp32 attention on the SDPA's own inputs, every head of every TP group, PCC ≥ 0.99964 (gate 0.999), 4/4. Per (device, head) expanded vs absorbed on rotated / multi-user / partial scenarios and forced schedules (q160/k256 no K split, q64/k256 with 2–3 Q chunks per core): PCC ≥ 0.99962 (40/40). Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights` (2/2), including no new program-cache entry for layers whose only difference is their weights |
+| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
 | E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k | ◐ | K2.7 256k −16.3%, K2.7 50k −14.1%, K3 50k −12.5%, K3 512k −14.6% (just under 15%: Phase 2) |
-| E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. Prefetch off is not traced yet |
-| E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 was not re-run |
+| E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet |
+| E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 `absorbed` passes (with per-layer weight scaling added for E4) |
 | E6 | Two reviews per commit | ◐ | Phase 1 (`c19695fd7b5`) reviewed by both, no blocker ([log](reviews/c19695fd7b5.md)); the fix commit is pending review |
 
 ## Accuracy (E2)
@@ -78,15 +78,15 @@ schedule:
 
 - **The expansion takes ≈ 4.05 ms** (16/15 × 3.80 ms), about 24% of the expanded SDPA.
 - **Throughput:** it is 16.8M MACs per core per K chunk. Going from 576 to 192 wide saves 31.5M QK MACs, worth
-  19.71 − 12.49 = 7.2 ms. So the expansion runs at ≈ 95% of QK's MAC throughput, well above the plan's 60% floor.
+  19.71 − 12.49 = 7.2 ms. So the expansion runs at ≲ 95% of QK's MAC throughput, well above the plan's 60% floor.
+  It's an upper bound: the 7.2 ms also includes the narrower Q read and other non-MAC savings.
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
 
 ## Next steps
 
 1. Review the Phase 1 fix commit (E6).
-2. A standalone op-level test (E1) against a torch un-absorbed reference: K-split bands with an empty band, chunk 0.
-3. E4: trace the prefetch-off case too.
-4. Phase 2, the head-group exchange (PLAN.md §3.4): removes the remaining 2× redundant expansion, which is the path
+2. E4: trace the prefetch-off case too.
+3. Phase 2, the head-group exchange (PLAN.md §3.4): removes the remaining 2× redundant expansion, which is the path
    to ≥ 15% at K3 512k. Then a chunk retune.
-5. Model-level runs with weights (golden trace, transformer tests) with `PREFILL_MLA_EXPANDED_K=1`.
+4. Model-level runs with weights (golden trace, transformer tests) with `PREFILL_MLA_EXPANDED_K=1`.
