@@ -333,7 +333,12 @@ def _build_gemma4_vision(
         mesh_config=mesh_config,
         ccl_manager=ccl_manager,
     )
+    t0 = time.time()
     vision_state_dict = _build_vision_state_dict(state_dict, vision_args)
+    logger.info(
+        f"Gemma4 vLLM: vision tower state dict ready ({len(vision_state_dict)} tensors) in {time.time() - t0:.1f}s"
+    )
+    t0 = time.time()
     vision_tower = VisionTower(
         args=vision_args,
         dtype=vision_dtype,
@@ -341,6 +346,7 @@ def _build_gemma4_vision(
         tt_ccl=TT_CCL(mesh_device),
         weight_cache_path=vision_args.weight_cache_path(vision_dtype),
     )
+    logger.info(f"Gemma4 vLLM: vision tower on device in {time.time() - t0:.1f}s")
     embed_vision = Gemma4MultimodalEmbedder.from_state_dict(
         mesh_device=mesh_device,
         state_dict=state_dict,

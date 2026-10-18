@@ -101,7 +101,9 @@ def _build_vision_state_dict(full_state_dict, vision_args):
     """Extract ``model.vision_tower.*`` from the full checkpoint and convert to
     the ``visual.*`` Meta-format keys ``VisionTower`` expects."""
     prefix = "model.vision_tower."
-    vision_sd = {k[len(prefix) :]: v for k, v in full_state_dict.items() if k.startswith(prefix)}
+    # ``.contiguous()``: a cold load hands out views of the checkpoint's file mapping; take the
+    # tower's ~1.1 GB into memory here rather than page by page during the device writes.
+    vision_sd = {k[len(prefix) :]: v.contiguous() for k, v in full_state_dict.items() if k.startswith(prefix)}
     vision_sd = standardize_hf_keys_multimodal(vision_sd)
     vision_sd = _convert_vision_block_hf_to_meta(
         vision_sd, vision_args.n_heads, vision_args.n_kv_heads, vision_args.head_dim
@@ -144,14 +146,20 @@ def load_vision_state_dict(model_path):
     from safetensors import safe_open
 
     out = {}
+    t0 = time.time()
     for fn in files:
         with safe_open(fn, "pt") as f:
             for k in f.keys():
                 if k.startswith(VISION_KEY_PREFIXES):
                     t = f.get_tensor(k)
-                    out[k] = t.to(torch.bfloat16) if t.dtype == torch.float32 else t
+                    # Materialise now: safetensors hands out views of the file mapping, and a
+                    # checkpoint on a network mount would otherwise be paged in piecemeal
+                    # while the tower's weights are written to the device (a silent stall).
+                    out[k] = (t.to(torch.bfloat16) if t.dtype == torch.float32 else t).clone()
     if not out:
         raise FileNotFoundError(f"no vision tensors ({VISION_KEY_PREFIXES}) under {path}")
+    total = sum(t.numel() * t.element_size() for t in out.values())
+    logger.info(f"Read {len(out)} vision tensors ({total / 1e9:.2f} GB) from {path} in {time.time() - t0:.1f}s")
     return out
 
 
