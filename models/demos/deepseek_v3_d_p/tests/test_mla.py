@@ -2879,6 +2879,8 @@ def test_ring_joint_expanded_k_causal_vs_reference(
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     sp, tp = tuple(mesh_device.shape)
     rows = 5120 // sp
+    # Pin the schedule this test exists for: q320 gives two Q chunks per head (a pair), one Q chunk per core.
+    monkeypatch.setattr(ttMLA, "_EXPANDED_K_SDPA_CHUNKS", {key: (320, 256, 1) for key in ttMLA._EXPANDED_K_SDPA_CHUNKS})
     recorder = _SdpaRecorder(monkeypatch, keep_inputs=True, keep_device_rows=rows)
     _run_chunked_prefill(
         request,
@@ -2891,6 +2893,12 @@ def test_ring_joint_expanded_k_causal_vs_reference(
     (call,) = recorder.calls
     assert call["expanded"] == expanded_k
     dev, kw = call["device"], call["device"]["kwargs"]
+    if expanded_k:
+        # Pair prerequisites (the factory's head groups): two Q chunks per head, at most one Q chunk per core.
+        grid = mesh_device.compute_with_storage_grid_size()
+        units = dev["q"].shape[1] * (rows // call["q_chunk"])
+        assert call["q_chunk"] == 320 and rows // call["q_chunk"] == 2, f"q chunk {call['q_chunk']}: no head pairs"
+        assert units <= (grid.x - 1) * grid.y, f"{units} (head, Q chunk) units: more than one per core, no pairs"
     heads = dev["q"].shape[1] * tp
     tt_ccl = get_tt_ccl(mesh_device)
     sdpa = ttnn.transformer.ring_joint_scaled_dot_product_attention._recorded_op
