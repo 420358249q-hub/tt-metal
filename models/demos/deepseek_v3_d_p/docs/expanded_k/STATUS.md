@@ -183,7 +183,8 @@ Measured at the author's request, as input for optimisation, not as a gate.
 5. Phase 4 (open until E5 passes): **default on for Kimi** (author, 2026-10-18), with 2k-chunk schedules from a 512k
    HiFi2 sweep (K3 q128 / k256 / 2, K2.7 q128 / k256 / 3). Still to do: the E5 regression set on the new default.
 6. The unrolled-V accuracy gap against main's `ring_mla` (0.001 on K2.7 to 0.005 on K3, found in the perf matrix) is
-   fixed in `71e49173813`: the V expansion accumulates in fp32 at HiFi4. CPU reference, 10k prefix + two 5k chunks,
+   fixed in `71e49173813`: the V expansion accumulates in fp32 (now at HiFi2: HiFi4 gave the same PCC, K3 0.99828 and
+   K2.7 0.99751 at both, and HiFi2 costs less; 512k forward at HiFi2 K3 47.15 ms, K2.7 31.78 ms). CPU reference, 10k prefix + two 5k chunks,
    HiFi2 SDPA: K3 0.99322 → 0.99826 (expanded K 0.99828; main 0.99805), K2.7 0.99637 → 0.99749 (main 0.99738). The
    512k forward costs +1.2% (K3 61.79 → 62.52 ms) and +0.6% (K2.7 42.84 → 43.11 ms). bf8 storage of V was not the
    cause, so `ring_joint` needs no mixed-dtype support.

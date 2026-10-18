@@ -1217,7 +1217,7 @@ class ttMLA:
         return slot_buf
 
     # V expansion (minimal_matmul), swept on Blackhole (bf16 accumulation at HiFi2 with 8x1 / 4x2 subblocks, before the
-    # move to fp32 accumulation at HiFi4 with 4x1 / 2x2, ~1% of the forward; 2k-262k local rows): the whole
+    # move to fp32 accumulation with 4x1 / 2x2; 2k-262k local rows): the whole
     # latent K in one block (packed straight to the output), hardware multicast of the input blocks and M along the
     # grid's y axis. M is split over the cores at runtime, so one config serves every KV length. At this many local
     # heads or more M8/N1 8x1 (Kimi-K3, 24; within 1.2% of the per-length best), below it M4/N2 4x2 (Kimi-K2.7, 16;
@@ -1274,10 +1274,11 @@ class ttMLA:
         )
         self._expand_v_compute_config = ttnn.init_device_compute_kernel_config(
             self.mesh_device.arch(),
-            # Each V_h element is a kv_lora_rank-term sum, stored in bf8. Accumulating it in bf16 at HiFi2 cost 0.001
-            # (K2.7) to 0.005 (K3) output PCC against main's ring_mla, which keeps V latent; fp32 accumulation at HiFi4
-            # recovers it (K3 0.99322 -> 0.99826, ring_mla 0.99805) for about 1% of the forward (expanded_k/STATUS.md).
-            math_fidelity=ttnn.MathFidelity.HiFi4,
+            # Each V_h element is a kv_lora_rank-term sum, stored in bf8. Accumulating it in bf16 cost 0.001 (K2.7) to
+            # 0.005 (K3) output PCC against main's ring_mla, which keeps V latent; fp32 accumulation recovers it (K3
+            # 0.99322 -> 0.99828, ring_mla 0.99805; expanded_k/STATUS.md). HiFi2 is exact for the bf8 operands: HiFi4
+            # gave the same PCC on K3 and K2.7.
+            math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,

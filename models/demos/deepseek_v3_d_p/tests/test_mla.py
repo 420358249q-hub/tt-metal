@@ -2705,7 +2705,7 @@ def test_mla_expanded_k_default_selection(request, mesh_device, device_params, v
     assert bool(declined) == (env == "1" and not supported), declined
 
 
-# Unrolled-V accuracy floor (docs/expanded_k/STATUS.md): the V expansion accumulates in fp32 at HiFi4. Accumulated in
+# Unrolled-V accuracy floor (docs/expanded_k/STATUS.md): the V expansion accumulates in fp32. Accumulated in
 # bf16 at HiFi2 it scored K3 0.99322 and K2.7 0.99637 here (main's ring_mla 0.99805 / 0.99738; fp32 0.99826 / 0.99749),
 # and the harness's own 0.98 checks would not notice.
 _UNROLLED_V_MIN_PCC = {"kimi_k3": 0.9978, "kimi_k2_7": 0.9968}
