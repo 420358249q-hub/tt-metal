@@ -2742,9 +2742,9 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
             logger.info(f"step {step} layer {layer}: expanded K vs absorbed PCC {pcc:.6f}")
             assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"step {step} layer {layer}: expanded vs absorbed PCC {pcc}"
 
-    # The layers really share programs: on sp_only (no prefetch) and the same cache layer (the metadata path keys the SDPA
-    # program by cache layer), once layer 0 has compiled its programs, layers 1 and 2 -- only their weights differ --
-    # add no program-cache entry, i.e. W_UK's address is patched, not hashed.
+    # The layers really share programs: on sp_only (no prefetch) and the same cache layer (the metadata path keys the
+    # SDPA program by cache layer), once layer 0 has compiled its programs, layers 1 and 2 -- only their weights
+    # differ -- add no program-cache entry, i.e. W_UK's address is patched, not hashed.
     for mla_layer in layers:
         mla_layer.set_tp_shard_kv(False)
         mla_layer._expanded_k = True
@@ -2759,7 +2759,8 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
     assert entries > before, "the program cache did not record layer 0's sp_only programs"
     shared = {layer: forward_layer(cache, 0, layer, cache_layer_idx=0) for layer in (1, 2)}
     assert mesh_device.num_program_cache_entries() == entries, "a layer with different weights compiled new programs"
-    # ... and the shared program used each layer's own W_UK (step 0 writes only its own chunk, so each run's inputs match).
+    # ... and the shared program used each layer's own W_UK (step 0 writes only its own chunk, so each run's inputs
+    # match).
     for layer in (1, 2):
         layers[layer]._expanded_k = False
         absorbed = forward_layer(cache, 0, layer, cache_layer_idx=0)
@@ -2785,12 +2786,13 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
     request, mesh_device, device_params, variant, expanded_k, tp_shard_kv, use_metadata_tensor, valid, monkeypatch
 ):
     """E1: the ring_joint SDPA output per head against fp32 attention on the device's own inputs, for one chunk at
-    position 0 (natural token order: chip s holds tokens s*640..s*640+639), full or partial. At position 0 a partial chunk
-    is the full one restricted to its valid query rows (causally they see no pad keys); it adds the unwritten pad rows
-    of the cache and buffers, not partial-chunk masking, which is checked against absorbed only. Expanded: K_h = [c_kv @ W_UK_h^T | k_pe] and Q un-absorbed; absorbed: the latent
-    K and Q. Causal. K is the cache slot (sp_only) or the TP latent buffer (tp_sharded). K2.7's three K-split bands
-    leave some bands empty on chunk 0. PCC is checked per (query chip, head): output norms fall with the row index, so
-    one PCC over all rows would be dominated by chip 0, whose queries read only local K."""
+    position 0 (natural token order: chip s holds tokens s*640..s*640+639), full or partial. At position 0 a partial
+    chunk is the full one restricted to its valid query rows (causally they see no pad keys); it adds the unwritten
+    pad rows of the cache and buffers, not partial-chunk masking, which is checked against absorbed only. Expanded:
+    K_h = [c_kv @ W_UK_h^T | k_pe] and Q un-absorbed; absorbed: the latent K and Q. Causal. K is the cache slot
+    (sp_only) or the TP latent buffer (tp_sharded). K2.7's three K-split bands leave some bands empty on chunk 0. PCC
+    is checked per (query chip, head): output norms fall with the row index, so one PCC over all rows would be
+    dominated by chip 0, whose queries read only local K."""
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     recorder = _SdpaRecorder(monkeypatch, keep_inputs=True)
     _run_chunked_prefill(

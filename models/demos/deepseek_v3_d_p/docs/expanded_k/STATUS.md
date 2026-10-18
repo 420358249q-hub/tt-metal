@@ -89,11 +89,12 @@ schedule:
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
 
-**Decision (2026-10-18): Phase 1's stop criterion (expansion ≥ 60% of QK's MAC throughput) is waived, not passed.**
-- Its purpose is to stop when the expansion cannot pay for itself. The measured gains already show that it does.
-- Phase 2 is the step that tests the remaining question directly: halving the expansion should move the SDPA by about
-  as much as the expansion's measured cost.
-- This is recorded here for the author to confirm.
+**Proposed waiver (2026-10-18), awaiting the author's confirmation:** skip Phase 1's stop criterion (expansion
+≥ 60% of QK's MAC throughput); it is neither passed nor failed.
+- **What the floor guards:** per PLAN §0, 60% is the throughput at which the projected SDPA saving (≈ 26%) still clears
+  E3. E3 is not yet met: K3 512k is at −14.6% against 15%.
+- **Why skip it:** Phase 2 (head groups) halves the expansion, and its own measurement settles whether E3 clears. If it
+  doesn't, the criterion applies again and the plan is re-examined before any further phase.
 
 ## Next steps
 
