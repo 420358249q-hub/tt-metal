@@ -83,18 +83,18 @@ schedule:
   - **Lower end:** a peak-based estimate (HiFi2, about 2 k MACs per cycle per core, 200–340 K chunks per core) puts
     the expansion at roughly 30–50% of FPU peak, against QK's ≈ 70% math utilisation. That ratio is roughly
     0.43–0.71.
-  - **So the 60% floor is not established.** What it guards, a net gain, is measured directly (−12.5% to −16.3% at all four
-    points, with the expansion still 2× redundant). A blocked (multi-tile) expansion matmul is the lever if
-    throughput matters after Phase 2.
+  - **So the 60% floor is not established** (see the proposed waiver below). A blocked (multi-tile) expansion matmul
+    is the lever if throughput still limits E3 after Phase 2.
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
 
 **Proposed waiver (2026-10-18), awaiting the author's confirmation:** skip Phase 1's stop criterion (expansion
 ≥ 60% of QK's MAC throughput); it is neither passed nor failed.
-- **What the floor guards:** per PLAN §0, 60% is the throughput at which the projected SDPA saving (≈ 26%) still clears
-  E3. E3 is not yet met: K3 512k is at −14.6% against 15%.
-- **Why skip it:** Phase 2 (head groups) halves the expansion, and its own measurement settles whether E3 clears. If it
-  doesn't, the criterion applies again and the plan is re-examined before any further phase.
+- **What the floor guards:** per PLAN §0, 60% is the throughput at which the projected SDPA saving (≈ 26% of the
+  SDPA) still clears E3. E3 is measured on the whole MLA forward and is not yet met: K3 512k is at −14.6% against 15%.
+- **Why skip it:** Phase 2 (head groups) halves the expansion, and the waiver pulls E3's measurement forward from
+  Phase 3 to the end of Phase 2. If E3 still doesn't clear, the criterion applies again and the plan is re-examined
+  before Phase 3.
 
 ## Next steps
 
