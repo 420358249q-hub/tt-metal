@@ -1260,7 +1260,7 @@ class ttMLA:
             M_block_size=8 if wide else 4,
             K_block_size=self.kv_lora_rank // ttnn.TILE_SIZE,
             N_block_size=1 if wide else 2,
-            subblock_h=8 if wide else 4,
+            subblock_h=4 if wide else 2,  # 4 tiles: the fp32 destination holds half as many
             subblock_w=1 if wide else 2,
             compute_with_storage_grid_size=ttnn.CoreCoord(*self.ring_sdpa_compute_grid),
             hw_mcast=True,
@@ -1268,9 +1268,12 @@ class ttMLA:
         )
         self._expand_v_compute_config = ttnn.init_device_compute_kernel_config(
             self.mesh_device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            # Each V_h element is a kv_lora_rank-term sum, stored in bf8. Accumulating it in bf16 at HiFi2 cost 0.001
+            # (K2.7) to 0.005 (K3) output PCC against main's ring_mla, which keeps V latent; fp32 accumulation at HiFi4
+            # recovers it (K3 0.99322 -> 0.99826, ring_mla 0.99805) for about 1% of the forward (expanded_k/STATUS.md).
+            math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
-            fp32_dest_acc_en=False,
+            fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
         # Host-path (no metadata) row count, rewritten in place every chunk.
