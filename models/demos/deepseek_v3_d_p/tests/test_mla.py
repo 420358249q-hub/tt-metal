@@ -938,9 +938,10 @@ def _run_chunked_prefill(
                 if profile:
                     # With several cache layers, profile layer 1 after an eager layer 0 (see trace_time).
                     measured_layer = 1 if num_cache_layers > 1 else 0
-                    if measured_layer:
-                        ttnn.deallocate(_forward(0))
-                    tt_out, fwd_ns = _rt_profile_forward_ns(mesh_device, lambda: _forward(measured_layer))
+                    with mla_tt.tt_ccl.tp_latent_prefetch_chain():
+                        if measured_layer:
+                            ttnn.deallocate(_forward(0))
+                        tt_out, fwd_ns = _rt_profile_forward_ns(mesh_device, lambda: _forward(measured_layer))
                     profiled_ns += fwd_ns
                     logger.info(f"  user {u} iter {i}: forward {fwd_ns / 1e6:.3f} ms (realtime profiler)")
                 elif trace_time:
@@ -950,9 +951,11 @@ def _run_chunked_prefill(
                     # timed replays (with the TP latent prefetch, layer 0 fills layer 1's latent buffer). Captures go
                     # through a SubDeviceTraceController: the prefetch loads a sub-device manager around the SDPA.
                     measured_layer = 1 if num_cache_layers > 1 else 0
-                    if measured_layer:
-                        ttnn.deallocate(_forward(0))
-                    tt_out = _forward(measured_layer)
+                    # One prefetch chain per pass over the layers (layer 0 prefetches layer 1's latent).
+                    with mla_tt.tt_ccl.tp_latent_prefetch_chain():
+                        if measured_layer:
+                            ttnn.deallocate(_forward(0))
+                        tt_out = _forward(measured_layer)
                     ttnn.synchronize_device(mesh_device)
                     eager_flat = ttnn.to_torch(
                         tt_out,
@@ -961,14 +964,19 @@ def _run_chunked_prefill(
                         ),
                     )
                     controllers = []
-                    for layer in range(measured_layer + 1):
-                        controllers.append(SubDeviceTraceController(mesh_device))
-                        mla_tt.set_trace_controller(controllers[-1])
-                        controllers[-1].begin_capture()
-                        tt_replayed = _forward(layer)
-                        controllers[-1].end_capture()
+                    with mla_tt.tt_ccl.tp_latent_prefetch_chain():
+                        for layer in range(measured_layer + 1):
+                            controllers.append(SubDeviceTraceController(mesh_device))
+                            mla_tt.set_trace_controller(controllers[-1])
+                            controllers[-1].begin_capture()
+                            tt_replayed = _forward(layer)
+                            controllers[-1].end_capture()
                     mla_tt.set_trace_controller(None)
                     *lead, timed = controllers
+                    # The timed output is allocated after the lead trace and the first segments were captured, so
+                    # allocation tracking flags it; every timed replay rewrites it in its last segment before it is
+                    # read.
+                    TraceAllocationTracker.acknowledge_corruptible(tt_replayed)
                     if tp_shard_kv:
                         # The eager forwards left the right latent in the buffers; poison them so the replays have
                         # to gather (or prefetch) it again for the output check below to pass.
@@ -1054,6 +1062,8 @@ def _run_chunked_prefill(
         ttnn.synchronize_device(mesh_device)
         ttnn.distributed_context_barrier()
 
+    # The TP latent prefetch's sub-device manager must not outlive the mesh.
+    mla_tt.release_sparse_mla_overlap_manager()
     if profile:
         return profiled_ns
     if trace_time:
@@ -1723,14 +1733,16 @@ def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
 
 # G3 gates for the TP-sharded cache (docs/unrolled_v_tp_sharded_kv/PLAN.md X5, §4.4): traced forward overhead vs sp_only
 # of a steady-state layer, with the TP latent prefetched during the previous layer's SDPA. Measured on a Galaxy 8x4
-# (2026-10-17): K3 50k +0.19/+0.06%, K3 512k +0.14/+0.07%, K2.7 50k +1.15/+1.37/+1.33/+0.77/+1.29% (the gather is fixed
-# latency there, which running it concurrently does not hide), K2.7 256k +0.31/+0.11%; serial, +0.2-0.6%, +0.9-1.1%,
-# +1.4-2.6% and +1.6-1.7%. Each gate is the worst sample plus about 1 pp of run-to-run noise.
+# (2026-10-17): K3 50k +0.19/+0.06%, K3 512k +0.14/+0.07%, K2.7 50k +1.15/+1.37/+1.33/+0.77/+1.29% (mean +1.18%; the
+# gather is fixed latency there, which running it concurrently does not hide), K2.7 256k +0.31/+0.11%. Serial: +0.19/
+# +0.62%, +0.92/+1.08%, +1.52/+1.39/+2.56/+1.78/+1.32% (mean +1.71%) and +1.73/+1.55%. Each prefetch gate is the worst
+# sample plus about 1 pp of run-to-run noise.
+# The serial gather (PREFILL_TP_LATENT_PREFETCH=0) keeps Phase 2's gates.
 _TP_SHARDED_PERF_POINTS = [
-    pytest.param("kimi_k3", 50 * 1024, 0.012, id="k3-50k"),
-    pytest.param("kimi_k3", 512 * 1024, 0.011, id="k3-512k"),
-    pytest.param("kimi_k2_7", 50 * 1024, 0.024, id="k2_7-50k"),
-    pytest.param("kimi_k2_7", 256 * 1024, 0.013, id="k2_7-256k"),
+    pytest.param("kimi_k3", 50 * 1024, 0.012, 0.025, id="k3-50k"),
+    pytest.param("kimi_k3", 512 * 1024, 0.011, 0.022, id="k3-512k"),
+    pytest.param("kimi_k2_7", 50 * 1024, 0.024, 0.030, id="k2_7-50k"),
+    pytest.param("kimi_k2_7", 256 * 1024, 0.013, 0.030, id="k2_7-256k"),
 ]
 
 
@@ -1745,7 +1757,9 @@ _TP_SHARDED_PERF_POINTS = [
     ],
     indirect=["mesh_device", "device_params"],
 )
-@pytest.mark.parametrize("variant,prefill_len,max_overhead", _TP_SHARDED_PERF_POINTS, indirect=["variant"])
+@pytest.mark.parametrize(
+    "variant,prefill_len,max_overhead,max_serial_overhead", _TP_SHARDED_PERF_POINTS, indirect=["variant"]
+)
 @pytest.mark.parametrize("use_metadata_tensor", [True], ids=["metadata"])
 @pytest.mark.skipif(not is_blackhole(), reason="Galaxy perf gate")
 @pytest.mark.skipif(
@@ -1754,7 +1768,15 @@ _TP_SHARDED_PERF_POINTS = [
 )
 @pytest.mark.timeout(0)
 def test_mla_chunked_tp_sharded_traced_perf(
-    request, mesh_device, device_params, variant, prefill_len, max_overhead, use_metadata_tensor, monkeypatch
+    request,
+    mesh_device,
+    device_params,
+    variant,
+    prefill_len,
+    max_overhead,
+    max_serial_overhead,
+    use_metadata_tensor,
+    monkeypatch,
 ):
     """Traced-replay time of one 5k-chunk MLA forward at a long prefix, TP-sharded cache vs TP-replicated (sp_only),
     on the same build and machine. The timed forward is a steady-state layer (layer 1 of 3): with the TP latent
@@ -1786,6 +1808,10 @@ def test_mla_chunked_tp_sharded_traced_perf(
     assert (
         overhead["prefetch"] <= max_overhead
     ), f"tp_sharded overhead {overhead['prefetch'] * 100:+.2f}% above +{max_overhead * 100:.1f}%"
+    assert overhead["serial"] <= max_serial_overhead, (
+        f"tp_sharded serial overhead {overhead['serial'] * 100:+.2f}% above +{max_serial_overhead * 100:.1f}% "
+        "(PREFILL_TP_LATENT_PREFETCH=0)"
+    )
 
 
 # X6: per-chip DRAM saving of the TP-deduped cache, net of the two TP latent buffers, scaled to the model's MLA layers.
@@ -1854,9 +1880,10 @@ def test_mla_tp_sharded_dram_saving(mesh_device, device_params, config_only, var
 
 
 # X4: a captured multi-layer forward replayed with the user and prefix changed between replays, on the TP-sharded
-# cache, must equal the eager forwards bit for bit, and those must equal the TP-replicated (sp_only) eager forwards. Layer
-# 0 prefetches layer 1's TP latent during its SDPA (a segmented capture), two users share each layer's cache, the user
-# order makes the prefix go long -> short -> long, and user 1's starts are rotated (not chunk-aligned).
+# cache, must equal the eager forwards bit for bit, and those must equal the TP-replicated (sp_only) eager forwards. Each
+# of three layers but the last prefetches the next one's TP latent during its SDPA (a segmented capture; layer 2 reuses
+# layer 0's buffer), two users share each layer's cache, the user order makes the prefix go long -> short -> long, and
+# user 1's starts are rotated (not chunk-aligned).
 _X4_STEPS = [(0, 0), (1, 0), (0, 5120), (0, 10240), (1, 2560), (0, 15360), (1, 7680)]
 
 
@@ -1880,7 +1907,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     chunk = 5120
     seq_len_cache = 4 * chunk
     config.max_seq_len = seq_len_cache
-    num_layers, num_users = 2, 2
+    num_layers, num_users = 3, 2
     hidden_size = config.hidden_size
     kvpe_dim = config.kv_lora_rank + config.qk_rope_head_dim
     topology = per_axis_topology(device_params["fabric_config"])
@@ -1964,19 +1991,21 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
         )
 
     def forward_all(cache, hiddens):
-        return [
-            layers[layer].forward(
-                hidden_states=hiddens[layer],
-                rope_tensors=rope,
-                kvpe_cache=cache,
-                actual_start=None,
-                actual_end=None,
-                cache_layer_idx=layer,
-                cache_user_id=0,
-                metadata=metadata,
-            )
-            for layer in range(num_layers)
-        ]
+        # One pass over the layers of a chunk: each layer prefetches the next one's TP latent during its SDPA.
+        with layers[0].tt_ccl.tp_latent_prefetch_chain():
+            return [
+                layers[layer].forward(
+                    hidden_states=hiddens[layer],
+                    rope_tensors=rope,
+                    kvpe_cache=cache,
+                    actual_start=None,
+                    actual_end=None,
+                    cache_layer_idx=layer,
+                    cache_user_id=0,
+                    metadata=metadata,
+                )
+                for layer in range(num_layers)
+            ]
 
     def poison(seed):
         _poison_tp_latent_slot(
@@ -2018,8 +2047,8 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     # could land on the trace's buffers). The live-buffer half of that rule is enforced only when run with
     # TT_METAL_TRACE_ALLOC_TRACKING=1.
     program_entries = mesh_device.num_program_cache_entries()
-    # Layer 0 prefetches layer 1's TP latent during its SDPA, inside a sub-device manager, so the capture is split at
-    # each load/clear.
+    # Each layer but the last prefetches the next one's TP latent during its SDPA, inside a sub-device manager, so the
+    # capture is split at each load/clear; layer 2 reuses layer 0's buffer.
     controller = SubDeviceTraceController(mesh_device)
     for mla_layer in layers:
         mla_layer.set_trace_controller(controller)
@@ -2098,6 +2127,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
         controller.release()
         for mla_layer in layers:
             mla_layer.set_trace_controller(None)
+        layers[0].release_sparse_mla_overlap_manager()
 
     # The caches themselves, un-striped to natural order: the traced, TP-sharded eager and TP-replicated eager runs must
     # have written identical bytes into every (user, layer) slot, and every slot must hold data. Equal outputs alone
@@ -2225,7 +2255,11 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(tp_sharded)
 
-    def run(cache, step, poison_seed=None):
+    def run(cache, step, poison_seed=None, layers_to_run=None):
+        with layers[0].tt_ccl.tp_latent_prefetch_chain():
+            return run_layers(cache, step, poison_seed, layers_to_run)
+
+    def run_layers(cache, step, poison_seed, layers_to_run):
         user, start, valid = _PREFETCH_STEPS[step]
         if use_metadata_tensor:
             write_chunk_metadata(
@@ -2249,7 +2283,7 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
                 seed=poison_seed,
             )
         outs = []
-        for layer in range(num_layers):
+        for layer in layers_to_run or range(num_layers):
             gen = torch.Generator().manual_seed(1000 * step + layer)
             hidden = ttnn.from_torch(
                 torch.randn(1, 1, chunk, config.hidden_size, generator=gen, dtype=torch.bfloat16),
@@ -2303,6 +2337,18 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
     nat_sp = natural(caches["sp_only"], False)
     for name in ("serial", "prefetch"):
         assert torch.equal(natural(caches[name], True), nat_sp), f"{name} cache differs from sp_only"
+
+    # A prefetch never outlives its chain or a layout change: layer 0 then layer 1 in separate chains (the caller may
+    # have rewritten the metadata in between), or across set_tp_shard_kv, must gather serially.
+    consumed.clear()
+    run(caches["prefetch"], 0, layers_to_run=[0])
+    run(caches["prefetch"], 0, layers_to_run=[1])
+    with layers[0].tt_ccl.tp_latent_prefetch_chain():
+        run_layers(caches["prefetch"], 0, None, [0])
+        set_layout(True, prefetch=True)
+        run_layers(caches["prefetch"], 0, None, [1])
+    assert consumed == [], f"a prefetch was consumed across a chain boundary or a layout change: layers {consumed}"
+    layers[0].release_sparse_mla_overlap_manager()
     logger.success(
         f"✓ prefetch == serial == sp_only, outputs and caches bitwise, over {len(_PREFETCH_STEPS)} steps x "
         f"{num_layers} layers; layers 1..{num_layers - 1} consumed their prefetch on every step"

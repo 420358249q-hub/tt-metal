@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -196,6 +197,9 @@ class TT_CCL:
         # SDPA, and the host-side key of the prefetch the next layer may consume (None: nothing prefetched).
         self.tp_latent_prefetch_resources: TpLatentPrefetchResources | None = None
         self.tp_latent_prefetched = None
+        # (chain id, stop_layer) while a caller runs consecutive MLA layers of one chunk (tp_latent_prefetch_chain).
+        self.tp_latent_chain = None
+        self._tp_latent_chain_count = 0
 
     def get_fused_rmsnorm_resources(self, x, weight, cluster_axis, num_links):
         key = (
@@ -383,6 +387,25 @@ class TT_CCL:
             f"TP latent prefetch: SDPA={sdpa_core_grid.num_cores()} cores, TP gather={gather_core_grid.num_cores()} cores"
         )
         return self.tp_latent_prefetch_resources
+
+    @contextlib.contextmanager
+    def tp_latent_prefetch_chain(self, stop_layer=None):
+        """Scope in which a dense tp_shard_kv MLA layer prefetches the next cache layer's TP latent during its SDPA.
+
+        The caller promises that, inside the scope, the MLA forwards on this mesh are consecutive cache layers of one
+        chunk of one user with unchanged metadata, as a transformer forward over its layers is. The host cannot see
+        metadata values, so a prefetch is consumed only inside the scope that made it: entering or leaving one drops any
+        pending prefetch. No prefetch targets cache layer stop_layer or beyond (e.g. a kv_only last layer, which runs no
+        attention). Outside any scope, every layer gathers its own latent serially."""
+        previous = self.tp_latent_chain
+        self._tp_latent_chain_count += 1
+        self.tp_latent_chain = (self._tp_latent_chain_count, stop_layer)
+        self.tp_latent_prefetched = None
+        try:
+            yield
+        finally:
+            self.tp_latent_chain = previous
+            self.tp_latent_prefetched = None
 
     def reset_tp_latent_prefetch_semaphores(self) -> None:
         """Drain and restore the prefetch gather's semaphores after an aborted overlap region."""

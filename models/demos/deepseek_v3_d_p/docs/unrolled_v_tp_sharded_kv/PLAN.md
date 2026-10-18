@@ -42,8 +42,11 @@ rev 3.
   the pre-rebase branch.
 - **Phase 2:** X1–X8 all hold. This is the merge point.
 - **Phase 3 (optional):** traced-replay overhead ≤ +0.5% at all four points, with X2–X4 and X8 still holding.
-  Otherwise the overlap isn't merged. Outcome (§4.4 rev 5): met at K3 50k, K3 512k and K2.7 256k; K2.7 50k stays at
-  about +1.1% (serial ≈ +1.8%), where the gather is fixed latency that concurrency does not hide.
+  Otherwise the overlap isn't merged. Outcome (§4.4 rev 5): met at K3 50k, K3 512k and K2.7 256k. K2.7 50k stays at
+  +1.2% mean (serial +1.7% mean): the gather there is fixed latency that concurrency does not hide. **Open decision
+  for the author:** the overlap is committed on by default as a deliberate exception to this rule, since it is not slower
+  than serial on average anywhere and removes 0.5–1.4 pp at 256k–512k. The alternative is opt-in
+  (`PREFILL_TP_LATENT_PREFETCH`).
 
 **Stop and re-plan if:**
 - any of X2 or X4 fails for a reason other than a bug;
@@ -273,9 +276,22 @@ whole SP-local latent (`tt_kvpe`). So:
    `update_padded_kv_cache` without `tp_axis`, i.e. the pre-#59531 TP-replicated write, clamped to `actual_end`.
    The prefetch read this layer's cache before its write, so this chunk's rows in it are stale until then; rows
    past `actual_end` are written by neither and hold the same bytes either way.
-4. **Matching.** A host-side key, `tt_ccl.tp_latent_prefetched`, records what was prefetched: the cache buffer, layer,
-   and metadata tensors (metadata path), or the flat slot and prefix (scalar path). The next forward consumes the
-   prefetch only if its own key matches. Anything else, including layer 0, gathers serially as in Phase 2.
+4. **Matching.** The host cannot see metadata values, so the prefetch is scoped. It runs only inside
+   `tt_ccl.tp_latent_prefetch_chain()`, which the owner of the layer loop opens:
+   - `TtPrefillTransformer` and the K3 transformer each open one around their loop.
+   - The caller promises that the forwards inside are consecutive layers of one chunk, with unchanged metadata.
+   - `stop_layer` excludes a kv_only last layer.
+
+   A host-side key, `tt_ccl.tp_latent_prefetched`, records what was prefetched: the chain, cache buffer and layer, plus
+   either the metadata tensors (metadata path) or the flat slot and prefix (scalar path). The next forward consumes
+   the prefetch only if its key matches.
+
+   The key is dropped:
+   - on entering or leaving a chain;
+   - by `set_tp_shard_kv`;
+   - by every consuming forward.
+
+   Anything else, including layer 0 and any forward outside a chain, gathers serially as in Phase 2.
 5. **Traces.** The capture is split at each load/clear by `SubDeviceTraceController`, giving 2 extra segments per
    layer. `TtPrefillBlock` and the K3 block forward the controller to MLA. `PREFILL_TP_LATENT_PREFETCH=0` turns the
    prefetch off.
@@ -286,11 +302,12 @@ whole SP-local latent (`tt_kvpe`). So:
 **Result (steady-state layer, traced replays; STATUS.md):**
 - At 256k–512k the prefetch hides nearly all of the gather: K3 512k drops from +0.92% to +0.14%, and K2.7 256k from
   +1.73% to +0.31%.
-- At 50k the gather is mostly fixed latency and running it concurrently does not hide it: K2.7 50k is +1.15% mean over
-  4 runs (serial ≈ +1.8%). A region without the gather is no slower than `sp_only`, so the load/clear is not the cost.
-  Moving the gather to the SDPA's idle row 9 (`ring_sdpa_compute_grid` 11×9) or using one link changes nothing.
-- The Phase 3 exit (≤ +0.5% at all four points) is met at three of four points; K2.7 50k misses it, but the prefetch
-  is never slower than the serial gather.
+- At 50k the gather is mostly fixed latency, and running it concurrently does not hide it.
+  - K2.7 50k is +1.18% mean over 5 runs (+0.77 to +1.37%), against +1.71% mean serial (+1.32 to +2.56%).
+  - The load/clear is not the cost: a region without the gather is no slower than `sp_only`.
+  - Moving the gather to the SDPA's idle row 9 (`ring_sdpa_compute_grid` 11×9), or using one link, changes nothing.
+- The Phase 3 exit (≤ +0.5% at all four points) is met at three of four points. K2.7 50k misses it; there the prefetch
+  is within noise of serial and lower on average. See the open decision in §0.
 
 ### 4.5 Tests, perf, CI (in Phase 2, re-run after Phase 3)
 **Model**

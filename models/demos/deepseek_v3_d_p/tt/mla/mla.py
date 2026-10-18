@@ -1057,15 +1057,17 @@ class ttMLA:
                 seq_len_local=seq_len_local,
                 metadata=metadata,
             )
+            chain = self.tt_ccl.tp_latent_chain if self._tp_latent_prefetch else None
             key = self._tp_latent_key(**gather)
-            prefetched = self.tt_ccl.tp_latent_prefetched == key
+            prefetched = chain is not None and self.tt_ccl.tp_latent_prefetched == key
             self.tt_ccl.tp_latent_prefetched = None
             if prefetched:
                 kv_storage = self._tp_latent_slot(cache_layer_idx)
                 self._write_tp_latent_chunk(kv_storage, tt_kvpe, kv_actual_isl, actual_end, metadata)
             else:
                 kv_storage = self._tp_gather_latent(**gather)
-            if self._tp_latent_prefetch and cache_layer_idx + 1 < self.layer_num:
+            stop_layer = self.layer_num if chain is None or chain[1] is None else min(chain[1], self.layer_num)
+            if chain is not None and cache_layer_idx + 1 < stop_layer:
                 # The next layer of this user and chunk: same metadata, the cache slot one layer on.
                 prefetch = dict(gather, cache_batch_idx=cache_batch_idx + 1, cache_layer_idx=cache_layer_idx + 1)
             if metadata is not None:
@@ -1103,12 +1105,14 @@ class ttMLA:
 
     def _tp_latent_key(self, *, kvpe_cache, cache_batch_idx, cache_layer_idx, kv_actual_isl, seq_len_local, metadata):
         """Host-side identity of one layer's TP latent gather. A prefetch is consumed only by the forward with the same
-        key, i.e. the next layer of the same chunk: on the metadata path the same metadata tensors (their values are
-        read on-device by both), on the scalar path the same slot and prefix. Anything else gathers serially."""
-        storage = kvpe_cache.storage.buffer_address()
+        key, i.e. the next layer of the same chunk inside the same tt_ccl.tp_latent_prefetch_chain: on the metadata path
+        the same metadata tensors (whose values the chain's caller keeps fixed; both read them on-device), on the scalar
+        path the same slot and prefix. Anything else gathers serially."""
+        chain = self.tt_ccl.tp_latent_chain
+        scope = (chain and chain[0], kvpe_cache.storage.buffer_address(), seq_len_local)
         if metadata is not None:
-            return (storage, cache_layer_idx, seq_len_local, tuple(m and m.buffer_address() for m in metadata))
-        return (storage, cache_batch_idx, kv_actual_isl, seq_len_local)
+            return scope + (cache_layer_idx, tuple(m and m.buffer_address() for m in metadata))
+        return scope + (cache_batch_idx, kv_actual_isl)
 
     def _write_tp_latent_chunk(self, slot_buf, tt_kvpe, kv_actual_isl, actual_end, metadata):
         """Write this chunk's latent into a prefetched TP latent buffer, as the TP-replicated cache write would (every
@@ -2451,6 +2455,8 @@ class ttMLA:
         gather ahead of unrolled-V (_tp_gather_latent).
         Weights and buffers do not depend on it, so a built model can switch layout between runs."""
         self._tp_latent_prefetch = False
+        # A prefetch made under the previous configuration must not be consumed under this one.
+        self.tt_ccl.tp_latent_prefetched = None
         if tp_shard_kv is None:
             self.tp_shard_kv = self._has_indexer and self.tp_factor > 1
         else:

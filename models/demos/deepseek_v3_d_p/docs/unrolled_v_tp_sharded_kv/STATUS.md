@@ -21,10 +21,14 @@ Milestone: Phases 2 and 3 of [PLAN.md](PLAN.md) (TP latent gather; prefetched du
 3. The gather reads the ND-sharded cache directly, with no reshape, using a new `outer_block_rows` option. Each
    160-row region is gathered as its own rank-interleaved block.
 4. On the trace-safe path, the slot and the live extent come from the metadata tensors.
-5. **Phase 3, prefetch (PLAN.md §4.4):** layer L's SDPA runs inside a sub-device manager, and layer L+1's gather of
-   its earlier chunks runs alongside it, on the 6 cores and the TP links the SDPA leaves idle, into a second buffer.
-   Layer L+1 then writes only its own chunk into that buffer, locally. Layer 0, and any forward whose host-side key
-   doesn't match the prefetch, gathers serially as in step 1. `PREFILL_TP_LATENT_PREFETCH=0` turns it off.
+5. **Phase 3, prefetch (PLAN.md §4.4):** layer L's SDPA runs inside a sub-device manager. Alongside it, layer L+1's
+   gather of its earlier chunks runs on the 6 cores and the TP links the SDPA leaves idle, into a second buffer.
+   - Layer L+1 then writes only its own chunk into that buffer, locally.
+   - Prefetching happens only inside `tt_ccl.tp_latent_prefetch_chain()`, which the transformers open around their
+     layer loops.
+   - Layer 0, any forward outside a chain, and any forward whose host-side key doesn't match the prefetch gather
+     serially, as in step 1.
+   - `PREFILL_TP_LATENT_PREFETCH=0` turns it off.
 
 ## Commits (on top of `7d302b0c4e1`)
 
@@ -43,7 +47,8 @@ Milestone: Phases 2 and 3 of [PLAN.md](PLAN.md) (TP latent gather; prefetched du
 | `d4d22260987` | Round-8 review fixes: X4 program-cache snapshot taken before capture; baseline patch compiles its zeroing before capture (passes with allocation tracking) | [log](reviews/d4d22260987.md) |
 | `239b41cb8e5` | Round-9 review fix: baseline patch hands the replay's output on after the timing branch | [log](reviews/239b41cb8e5.md) |
 | `9944b580a13` | Review log for `239b41cb8e5` (docs only) | — |
-| *(last)* | Phase 3: TP latent prefetch during the previous layer's SDPA; steady-state perf test; gates | **pending** (next step 1) |
+| `0ae65be53c7` | Phase 3: TP latent prefetch during the previous layer's SDPA; steady-state perf test; gates | [log](reviews/0ae65be53c7.md) |
+| *(last)* | Phase 3 review fixes: prefetch chains (metadata safety), key dropped on layout change, kv_only stop layer, 3-layer X4, serial gate, manager release, docs | **pending** (next step 1) |
 
 Each code commit up to `239b41cb8e5` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
@@ -55,8 +60,8 @@ answered in its log.
 | X1 | `tp_shard_kv` runs unrolled-V, no `ring_mla` | ✅ | `_chunked_attn` / `_tp_gather_latent` |
 | X2 | `tp_sharded` bitwise equal to `sp_only` | ✅ | `test_mla_chunked_prefill_tp_sharded_matches_sp_only`: 58 passed on functional + golden inputs, plus 44 passed on CPU-reference inputs, with the shared slot poisoned before every forward. Exclusions: no K2.7 golden trace exists (2 skips), and the deep/production scenarios have no CPU-reference case (CPU MLA too slow); both run on functional inputs. The PR's `test_mla_chunked_prefill` `tp_sharded` matrix: 140 passed, 0 failed. |
 | X3 | No regressions | ✅ | 53 Galaxy MLA tests pass on `sp_only`, with PCCs identical to before the merge. K3 KDA carry (`kimi_k3/test_chunked_prefill.py`): 4/4. |
-| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts on a chip boundary), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise, for both the outputs and the un-striped caches, with every (user, layer) slot written. Layouts alternate: the capture stays alive through the `sp_only` pass, then eager `tp_sharded` forwards and a second replay of the same capture must still match. Every program is compiled before the capture. Rows past user 1's extent are written only in user 0's slots, which catches a transposed slot mapping. No program compiles while the trace is alive (asserted); with `TT_METAL_TRACE_ALLOC_TRACKING=1` no allocation made while it is alive is live at a replay (passes). Mid-chip rotated starts are covered by the single-layer X2 scenarios. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced (Phase 2; not re-run with the prefetch, which needs the model weights). **Phase 3:** layer 0 now prefetches layer 1's latent during its SDPA, so the capture is segmented (`SubDeviceTraceController`); the test passes for K2.7 and K3 with allocation tracking (the two outputs, allocated in the last segment, are acknowledged). `test_mla_tp_latent_prefetch_matches_sp_only` (K2.7, K3 × scalar, metadata; 3 layers, 2 users, chunk-aligned / chip-boundary / mid-chip starts, partial chunks): prefetch == serial == `sp_only` bitwise, outputs and caches, and layers 1–2 consumed their prefetch on every step. |
-| X5 | Traced perf gate | ✅ | Steady-state layer with the prefetch, two runs, 4/4 points each (below). Gates are the worst measured sample plus about 1 pp of measured noise: +1.2 / +1.1 / +2.4 / +1.3%. Phase 3's ≤ +0.5% holds at K3 50k, K3 512k and K2.7 256k; K2.7 50k stays at about +1.2% (serial about +1.8%). |
+| X4 | Captured multi-layer, multi-user trace | ✅ | `test_mla_tp_sharded_trace_replay_multi_layer` (K2.7, K3): 2 layers (each on its own cache slot), 2 users, one capture replayed over 7 steps with user and prefix changed in place (long → short → long, rotated starts on a chip boundary), slot poisoned before every replay. Traced replay == `tp_sharded` eager == `sp_only` eager, bitwise, for both the outputs and the un-striped caches, with every (user, layer) slot written. Layouts alternate: the capture stays alive through the `sp_only` pass, then eager `tp_sharded` forwards and a second replay of the same capture must still match. Every program is compiled before the capture. Rows past user 1's extent are written only in user 0's slots, which catches a transposed slot mapping. No program compiles while the trace is alive (asserted); with `TT_METAL_TRACE_ALLOC_TRACKING=1` no allocation made while it is alive is live at a replay (passes). Mid-chip rotated starts are covered by the single-layer X2 scenarios. The PR's 10-layer K2.7 transformer test passes `tp_sharded` traced and untraced (Phase 2; not re-run with the prefetch, which needs the model weights). **Phase 3:** 3 layers; each but the last prefetches the next layer's latent during its SDPA (layer 2 reuses layer 0's buffer), so the capture is segmented (`SubDeviceTraceController`); the test passes for K2.7 and K3 with allocation tracking (the outputs, allocated in the last segment, are acknowledged). `test_mla_tp_latent_prefetch_matches_sp_only` (K2.7, K3 × scalar, metadata; 3 layers, 2 users, chunk-aligned / chip-boundary / mid-chip starts, partial chunks): prefetch == serial == `sp_only` bitwise, outputs and caches, and layers 1–2 consumed their prefetch on every step. |
+| X5 | Traced perf gate | ✅ | Steady-state layer with the prefetch, two runs, 4/4 points each (below). Gates are the worst measured sample plus about 1 pp of measured noise: +1.2 / +1.1 / +2.4 / +1.3%. Phase 3's ≤ +0.5% holds at K3 50k, K3 512k and K2.7 256k. K2.7 50k stays at +1.18% mean (serial +1.71% mean); see next step 2. The serial path keeps Phase 2's gates. |
 | X6 | DRAM saving | ✅ | `test_mla_tp_sharded_dram_saving`, measured per chip at exact capacities, net of both TP latent buffers: 0.645 GB (K3 512k), 0.886 GB (K2.7 256k) per user slot |
 | X7 | Op tests | ✅ | 18 new outer-block, width-gather and validation tests pass. Other failures in `test_high_bw_all_gather.py` on this Galaxy (3 bandwidth floors, 4 fabric-init errors) happen identically on main. |
 | X8 | Defaults and CI | ◐ | `sp_only` K3 50k is unchanged on the realtime profiler (7.654 / 7.660 ms vs 7.656 ms before). The criterion asks for a traced before/after, which was not measured: only the branch's traced `sp_only` (table below). **CI legs not run** (next step 4, deliberately out of this milestone). |
@@ -92,8 +97,9 @@ prefetched during layer 0's SDPA and which prefetches layer 2's during its own (
   - **Serial:** the TP gather runs ahead of the expansion. It costs about 0.1 ms at 50k, mostly fixed latency, and
     0.3–0.6 ms at 256k–512k.
   - **Prefetch:** hides nearly all of the gather at 256k–512k.
-  - **K2.7 50k:** three more prefetch runs gave +1.37 / +1.33 / +0.77%. There the gather is fixed latency, and running
-    it concurrently doesn't hide it.
+  - **K2.7 50k:** three more runs gave prefetch +1.37 / +1.33 / +0.77% and serial +1.39 / +2.56 / +1.78%. Over all
+    five, the means are +1.18% prefetch and +1.71% serial. There the gather is fixed latency, and running it
+    concurrently doesn't hide it.
   - **What it isn't:** the sub-device load/clear. A region without the gather measures 5.420 ms against 5.460 ms
     `sp_only`. Moving the gather to the SDPA's idle row 9, or using one link, changes nothing (+1.45%).
 - **Device profile, K2.7 50k layer 1 (prefetch vs `sp_only`):**
@@ -153,8 +159,10 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
 
 1. **Review the Phase 3 commit** (X9): Claude Code and Codex gpt-6-astra, per PLAN.md §0. Fix blockers and majors in a
    reviewed follow-up.
-2. **Decide on K2.7 50k.** The prefetch misses Phase 3's ≤ +0.5% there (about +1.2%, serial about +1.8%). It is
-   never slower than serial, so it is on by default; `PREFILL_TP_LATENT_PREFETCH=0` turns it off.
+2. **Decide on K2.7 50k (author).** The prefetch misses Phase 3's ≤ +0.5% there: +1.18% mean over 5 runs, against
+   +1.71% mean serial. It is on by default as a deliberate exception to PLAN §0's merge rule, since it is not slower
+   than serial on average and removes 0.5–1.4 pp at 256k–512k. The alternative is opt-in;
+   `PREFILL_TP_LATENT_PREFETCH=0` turns it off.
 3. **Model-level checks with weights:** the PR's K2.7 transformer test (`test_kimi_prefill_transformer_chunked_padded`
    `L10 and mid15k and tp_sharded`, traced and untraced) and the K3 transformer test, with the prefetch on. The
    transformer forwards the trace controller to MLA (`TtPrefillBlock`, and now the K3 block).
