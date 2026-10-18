@@ -2186,6 +2186,9 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
     num_layers, num_users = 3, 2
     kvpe_dim = config.kv_lora_rank + config.qk_rope_head_dim
     topology = per_axis_topology(device_params["fabric_config"])
+    # The TP latent prefetch's sub-device manager (created by the first layer) must not outlive the mesh, whatever the
+    # outcome.
+    request.addfinalizer(get_tt_ccl(mesh_device).release_tp_latent_prefetch_manager)
 
     layers = [
         ttMLA(
@@ -2206,8 +2209,6 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
         )
         for layer in range(num_layers)
     ]
-    # The TP latent prefetch's sub-device manager must not outlive the mesh, whatever the outcome.
-    request.addfinalizer(layers[0].release_sparse_mla_overlap_manager)
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
     rope = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=seq_len_cache, chunk_size_global=chunk)
     scale_buf = rope_setup.make_llama4_scale_buffer(chunk)
@@ -2343,6 +2344,7 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
     # A prefetch never outlives its chain or a layout change, so these must gather serially and match the serial path
     # bit for bit (the caches are equal, and re-running a step rewrites its rows with the same data):
     #   - layer 0 for user 0, the metadata rewritten in place for user 1, then layer 1 in a new chain;
+    #   - layer 0, then set_tp_shard_kv with prefetch still on (the pending key must be dropped), then layer 1;
     #   - layer 0 with prefetch on (buffer 1 pending), prefetch turned off, then layer 1 (which now reads buffer 0).
     def layer1_serial(step):
         set_layout(True, prefetch=False)
@@ -2354,13 +2356,68 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
     run(caches["prefetch"], 0, layers_to_run=[0])
     got = run(caches["prefetch"], 3, layers_to_run=[1])[0]
     assert torch.equal(got, layer1_serial(3)), "layer 1 for user 1 after layer 0 for user 0 in another chain"
-    with layers[0].tt_ccl.tp_latent_prefetch_chain():
-        run_layers(caches["prefetch"], 0, None, [0])
-        set_layout(True, prefetch=False)
-        got = run_layers(caches["prefetch"], 0, None, [1])[0]
-    assert torch.equal(got, layer1_serial(0)), "layer 1 after prefetch was turned off with a prefetch pending"
+    for prefetch_after in (True, False):
+        with layers[0].tt_ccl.tp_latent_prefetch_chain():
+            run_layers(caches["prefetch"], 0, None, [0])
+            set_layout(True, prefetch=prefetch_after)
+            got = run_layers(caches["prefetch"], 0, None, [1])[0]
+        set_layout(True, prefetch=True)
+        assert torch.equal(
+            got, layer1_serial(0)
+        ), f"layer 1 after set_tp_shard_kv (prefetch {prefetch_after}) with a prefetch pending"
     assert consumed == [], f"a prefetch was consumed across a chain boundary or a layout change: layers {consumed}"
     logger.success(
         f"✓ prefetch == serial == sp_only, outputs and caches bitwise, over {len(_PREFETCH_STEPS)} steps x "
         f"{num_layers} layers; layers 1..{num_layers - 1} consumed their prefetch on every step"
     )
+
+
+@pytest.mark.parametrize("kv_only_last_layer", [False, True], ids=["trunk", "kv_only_last"])
+def test_tp_latent_prefetch_chain_stop_layer(monkeypatch, kv_only_last_layer):
+    """Host-only: TtPrefillTransformer runs its layer loop inside one TP latent prefetch chain whose stop_layer is the
+    loop's attention-layer count, so the last attention layer never prefetches past it: neither the MTP cache slots
+    that follow the trunk, nor a kv_only last layer (which runs no attention)."""
+    import contextlib
+    from types import SimpleNamespace
+
+    import models.demos.deepseek_v3_d_p.tt.tt_prefill_transformer as transformer_module
+    from models.demos.deepseek_v3_d_p.tt.tt_prefill_transformer import TtPrefillTransformer
+
+    num_layers = 4
+    chains = []
+    active = []
+
+    @contextlib.contextmanager
+    def chain(stop_layer=None):
+        chains.append(stop_layer)
+        active.append(True)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    class FakeLayer:
+        def __call__(self, hidden, *args, **kwargs):
+            assert active, "a layer ran outside the prefetch chain"
+            return hidden, None
+
+    transformer = object.__new__(TtPrefillTransformer)
+    transformer.is_chunked = True
+    transformer.indexed_rope = object()
+    transformer._has_indexer = False
+    transformer.is_first_rank = False
+    transformer.indexer_types = None
+    transformer.first_layer_idx = 0
+    transformer.layers = [FakeLayer() for _ in range(num_layers)]
+    transformer.padding_side = "right"
+    transformer.kv_only_last_layer = kv_only_last_layer
+    transformer.is_last_rank = kv_only_last_layer
+    transformer.mesh_device = object()
+    monkeypatch.setattr(transformer_module, "signpost", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        transformer_module, "get_tt_ccl", lambda mesh_device: SimpleNamespace(tp_latent_prefetch_chain=chain)
+    )
+
+    transformer.forward(object(), kvpe_cache=object(), actual_isl=0, actual_start=0)
+    assert chains == [num_layers - 1 if kv_only_last_layer else num_layers], chains
+    assert not active, "the prefetch chain was left open"

@@ -50,7 +50,8 @@ Milestone: Phases 2 and 3 of [PLAN.md](PLAN.md) (TP latent gather; prefetched du
 | `0ae65be53c7` | Phase 3: TP latent prefetch during the previous layer's SDPA; steady-state perf test; gates | [log](reviews/0ae65be53c7.md) |
 | `dbe70a53d08` | Phase 3 review fixes: prefetch chains (metadata safety), key dropped on layout change, kv_only stop layer, 3-layer X4, serial gate, manager release, docs | [log](reviews/dbe70a53d08.md) |
 | `a167a715772` | Expanded-K plan rev 2 (docs only, [../expanded_k/PLAN.md](../expanded_k/PLAN.md)) | plan reviews (rev 1) in its §8 |
-| *(last)* | Phase 3 round-2 fixes: MTP stop layer, manager release on failure, stronger interruption checks, GLM host-test stub | **pending** (next step 1) |
+| `cb503a22535` | Phase 3 round-2 fixes: MTP stop layer, manager release on failure, stronger interruption checks, GLM host-test stub | [log](reviews/cb503a22535.md) |
+| *(last)* | Phase 3 round-3 fixes: both layout-change variants checked, finalizer before construction, host test of the transformer's stop layer | **pending** (next step 1) |
 
 Each code commit up to `239b41cb8e5` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.
