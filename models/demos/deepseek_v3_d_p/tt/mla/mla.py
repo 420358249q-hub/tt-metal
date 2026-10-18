@@ -557,11 +557,13 @@ class ttMLA:
             self.q_b_proj_weight = weights["q_b_proj"]
             self.wkv_b1_weight = weights["wkv_b1"]
             self.wkv_b2_weight = weights["wkv_b2"]
-            # Expanded K (docs/expanded_k/PLAN.md), PREFILL_MLA_EXPANDED_K=1: Q un-absorbed at 192 wide, K expanded per
-            # head inside the SDPA from the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked
-            # unrolled-V only; off by default.
-            if self.is_chunked and not self._has_indexer and os.getenv("PREFILL_MLA_EXPANDED_K", "0") == "1":
-                self._expanded_k = self._expanded_k_supported()
+            # Expanded K (docs/expanded_k/PLAN.md): Q un-absorbed at 192 wide, K expanded per head inside the SDPA from
+            # the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked unrolled-V only. On by
+            # default wherever a measured schedule exists (Kimi K2.7 / K3); PREFILL_MLA_EXPANDED_K=0 turns it off, =1
+            # also warns when it cannot apply.
+            expanded_k_mode = os.getenv("PREFILL_MLA_EXPANDED_K")
+            if self.is_chunked and not self._has_indexer and expanded_k_mode != "0":
+                self._expanded_k = self._expanded_k_supported(warn=expanded_k_mode == "1")
             if self.is_chunked and not self._has_indexer:
                 self._init_unrolled_v()
             self.o_proj_weight = weights["o_proj"]
@@ -1221,10 +1223,11 @@ class ttMLA:
     # within 5.2%). K3 at the Galaxy shape: 97 us, 71% FPU util.
     _UNROLLED_V_WIDE_LOCAL_HEADS = 24
 
-    def _expanded_k_supported(self) -> bool:
+    def _expanded_k_supported(self, warn: bool) -> bool:
         """Expanded K needs the kernel's MLA geometry (latent 512, per-head no-PE 128), no per-position query scale or
         balanced attention, and a measured chunk schedule for this shape: the absorbed model's chunks are sized for a
-        576-wide K and can overflow L1 beside the expanded K^T CB. Anything else keeps absorbed K, with a warning."""
+        576-wide K and can overflow L1 beside the expanded K^T CB. Anything else keeps absorbed K, with a warning when
+        expanded K was asked for explicitly."""
         heads_local = self.num_heads // self.tp_factor
         key = (self.kv_lora_rank + self.qk_rope_head_dim, heads_local, self.active_seq_len // self.sp_factor)
         reasons = [
@@ -1239,7 +1242,9 @@ class ttMLA:
             if bad
         ]
         if reasons:
-            logger.warning(f"PREFILL_MLA_EXPANDED_K ignored on layer {self.layer_idx}: {'; '.join(reasons)}")
+            (logger.warning if warn else logger.debug)(
+                f"PREFILL_MLA_EXPANDED_K ignored on layer {self.layer_idx}: {'; '.join(reasons)}"
+            )
             return False
         return True
 
@@ -1296,9 +1301,13 @@ class ttMLA:
     # Expanded K (docs/expanded_k/PLAN.md): every core still expands its head's whole K chunk (Phase 1), so fewer cores
     # per head wins. K3 at q320 runs 2 Q chunks per head in 2 K-split bands (each core expands half the heads' K once per
     # band slice), 12.5-14.6% under absorbed q160/k512 at 50k-512k; k512 does not fit L1 beside the expanded K^T CB.
+    # 2k chunks (256 rows per chip): q128 gives each head 2 Q chunks, so pairs still split the expansion; swept at 512k
+    # HiFi2 (K3 28.7 ms vs 46.2 for 1 band and 32.7 for q256 / 4 bands; K2.7 19.9 vs 25.9 / 24.3); k512 overflows L1.
     _EXPANDED_K_SDPA_CHUNKS = {
         (576, 24, 640): (320, 256, 2),
         (576, 16, 640): (320, 256, 3),
+        (576, 24, 256): (128, 256, 2),
+        (576, 16, 256): (128, 256, 3),
     }
 
     _UNROLLED_V_SDPA_CHUNKS = {
