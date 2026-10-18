@@ -2576,9 +2576,32 @@ class _SdpaRecorder:
 def _per_head_pccs(a, b, valid):
     """PCC per (device, head) of two per-device [1, heads, rows, dim] output lists, over the rows that carry real tokens
     (valid: an [sp, rows] bool mask; devices in mesh order sp * tp_size + tp). Devices with none are skipped."""
+    assert len(a) % valid.shape[0] == 0, f"{len(a)} devices vs {valid.shape[0]} SP rows"
     tp_size = len(a) // valid.shape[0]
     rows = [valid[d // tp_size] for d in range(len(a))]
     return [comp_pcc(x[0, h, r], y[0, h, r])[1] for x, y, r in zip(a, b, rows) if r.any() for h in range(x.shape[1])]
+
+
+def test_mla_per_head_pccs_real_rows():
+    """Host only: the real-row mask still catches an error on real rows of any (SP, TP) device, and ignores padding.
+    Shapes and mask follow the K3 pad-overflow final chunk: 8 x 4 mesh, 640 rows per chip, 32 real tokens on SP 7."""
+    sp, tp, heads, rows = 8, 4, 2, 640
+    positions = rotated_chip_positions(10176, sp, rows)
+    valid = torch.tensor([[p < 10208 for p in chip] for chip in positions])
+    assert valid.sum() == valid[sp - 1].sum() == 32
+    torch.manual_seed(0)
+    a = [torch.randn(1, heads, rows, 64) for _ in range(sp * tp)]
+    padded = [x.clone() for x in a]
+    for x, r in zip(padded, valid.repeat_interleave(tp, dim=0)):
+        x[:, :, ~r] = torch.randn_like(x[:, :, ~r])
+    assert min(_per_head_pccs(a, padded, valid)) > 0.9999, "padding rows were compared"
+    for d in range(sp * tp):
+        bad = [x.clone() for x in a]
+        r = valid[d // tp]
+        if not r.any():
+            continue
+        bad[d][0, 1, r] = torch.randn_like(bad[d][0, 1, r])
+        assert min(_per_head_pccs(a, bad, valid)) < 0.5, f"error on device {d} real rows missed"
 
 
 # Expanded K (docs/expanded_k/PLAN.md E1/E2): K expanded per head inside the SDPA is the same attention as the absorbed
