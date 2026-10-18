@@ -18,10 +18,11 @@ df = pd.read_csv(sys.argv[1], skiprows=1, skipinitialspace=True, usecols=range(1
 df.columns = [c.strip() for c in df.columns]
 c = ["PCIe slot", "core_x", "core_y", "RISC processor type", "run host ID"]
 # The valid readings (see above) must be present, or the profile was not taken with this probe and the sum zones on.
-for risc, zone in [("TRISC_1", "EXPK-CP"), ("TRISC_0", "EXPK-WAIT")]:
+VALID = [("TRISC_1", "EXPK-CP"), ("TRISC_0", "EXPK-WAIT")]
+for risc, zone in VALID:
     if not ((df["RISC processor type"] == risc) & (df["zone name"] == zone)).any():
         sys.exit(f"no {zone} on {risc}: apply expk_copy_probe.patch and set TT_METAL_PROFILER_SUM=1")
-for risc, col in [("TRISC_1", "EXPK-CP"), ("TRISC_0", "EXPK-WAIT")]:
+for risc, col in VALID:
     d = df[df["RISC processor type"] == risc]
     z = d[(d["zone name"] == col) & (d["time[cycles since reset]"] > 0)].pivot_table(
         index=c, columns="zone name", values="data", aggfunc="max"
