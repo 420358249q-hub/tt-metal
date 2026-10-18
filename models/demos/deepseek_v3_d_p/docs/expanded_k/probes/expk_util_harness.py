@@ -1,4 +1,14 @@
-# Expansion-utilisation harness (docs/expanded_k/STATUS.md); copy to tests/ and apply expk_util_probe.patch. One eager forward with the device profiler on, for the expansion / QK sum zones.
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Expansion-utilisation harness (docs/expanded_k/STATUS.md): one eager forward with the device profiler on, for the
+# expansion / QK sum zones. It needs the model's test fixtures, so from the repo root:
+#   git apply models/demos/deepseek_v3_d_p/docs/expanded_k/probes/expk_util_probe.patch
+#   cp models/demos/deepseek_v3_d_p/docs/expanded_k/probes/expk_util_harness.py \
+#      models/demos/deepseek_v3_d_p/tests/scratch_expk_util.py
+#   TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_SUM=1 scripts/run_safe_pytest.sh \
+#      models/demos/deepseek_v3_d_p/tests/scratch_expk_util.py -k k2_7   # then -k k3, one case per run
+# Each run writes generated/profiler/.logs/profile_log_device.csv; analyse it before the next run overwrites it.
 import pytest
 from loguru import logger
 
