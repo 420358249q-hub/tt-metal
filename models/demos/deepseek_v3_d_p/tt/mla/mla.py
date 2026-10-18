@@ -559,10 +559,10 @@ class ttMLA:
             self.wkv_b2_weight = weights["wkv_b2"]
             # Expanded K (docs/expanded_k/PLAN.md): Q un-absorbed at 192 wide, K expanded per head inside the SDPA from
             # the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked unrolled-V only. On by
-            # default wherever a measured schedule exists (Kimi K2.7 / K3); PREFILL_MLA_EXPANDED_K=0 turns it off, =1
-            # also warns when it cannot apply.
+            # default wherever a measured schedule exists (Kimi K2.7 / K3); PREFILL_MLA_EXPANDED_K=0 (or false / off)
+            # turns it off, =1 also warns when it cannot apply.
             expanded_k_mode = os.getenv("PREFILL_MLA_EXPANDED_K")
-            if self.is_chunked and not self._has_indexer and expanded_k_mode != "0":
+            if self.is_chunked and not self._has_indexer and expanded_k_mode not in ("0", "false", "off"):
                 self._expanded_k = self._expanded_k_supported(warn=expanded_k_mode == "1")
             if self.is_chunked and not self._has_indexer:
                 self._init_unrolled_v()
@@ -1216,11 +1216,12 @@ class ttMLA:
         )
         return slot_buf
 
-    # V expansion (minimal_matmul), swept on Blackhole (HiFi2, 2k-262k local rows, i.e. short to 512k KV): the whole
+    # V expansion (minimal_matmul), swept on Blackhole (bf16 accumulation at HiFi2 with 8x1 / 4x2 subblocks, before the
+    # move to fp32 accumulation at HiFi4 with 4x1 / 2x2, ~1% of the forward; 2k-262k local rows): the whole
     # latent K in one block (packed straight to the output), hardware multicast of the input blocks and M along the
     # grid's y axis. M is split over the cores at runtime, so one config serves every KV length. At this many local
     # heads or more M8/N1 8x1 (Kimi-K3, 24; within 1.2% of the per-length best), below it M4/N2 4x2 (Kimi-K2.7, 16;
-    # within 5.2%). K3 at the Galaxy shape: 97 us, 71% FPU util.
+    # within 5.2%). K3 at the Galaxy shape (bf16 era): 97 us, 71% FPU util.
     _UNROLLED_V_WIDE_LOCAL_HEADS = 24
 
     def _expanded_k_supported(self, warn: bool) -> bool:
@@ -1265,7 +1266,7 @@ class ttMLA:
             M_block_size=8 if wide else 4,
             K_block_size=self.kv_lora_rank // ttnn.TILE_SIZE,
             N_block_size=1 if wide else 2,
-            subblock_h=4 if wide else 2,  # 4 tiles: the fp32 destination holds half as many
+            subblock_h=4 if wide else 2,  # h x w = 4 tiles, the fp32 destination's limit (8 in bf16)
             subblock_w=1 if wide else 2,
             compute_with_storage_grid_size=ttnn.CoreCoord(*self.ring_sdpa_compute_grid),
             hw_mcast=True,
@@ -1291,8 +1292,8 @@ class ttMLA:
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
 
-    # Measured (Q chunk, K chunk, K splits) at the production shapes, keyed (kvpe width, local heads, local rows), all
-    # at 640 rows per chip (the 5k chunk on 8 SP devices):
+    # Measured (Q chunk, K chunk, K splits) at the production shapes, keyed (kvpe width, local heads, local rows); the
+    # absorbed entries are all at 640 rows per chip (the 5k chunk on 8 SP devices):
     #   Kimi-K3 (576, 24): q160 = 96 units on 96 cores;
     #   Kimi-K2.7 (576, 16): q320 k256 split three ways = 96 cores, 10% faster SDPA than q128 (80 cores);
     #   Mistral-Small-4 (320, 32): two waves of q128 beside a k640 chunk, 26% faster than three of q64 (the narrower K

@@ -1916,14 +1916,18 @@ _X4_STEPS = [(0, 0), (1, 0), (0, 5120), (0, 10240), (1, 2560), (0, 15360), (1, 7
 )
 @pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
 @pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
+@pytest.mark.parametrize("chunk", [5120, 2048], ids=["c5k", "c2k"])
 @pytest.mark.timeout(0)
-def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_params, variant, expanded_k, monkeypatch):
+def test_mla_tp_sharded_trace_replay_multi_layer(
+    request, mesh_device, device_params, variant, expanded_k, chunk, monkeypatch
+):
     # Expanded K (docs/expanded_k/PLAN.md E4): every layer passes its own wkv_b1 as the in-kernel K weight.
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     config, weights = request.getfixturevalue("random_weights")
     sp_axis, tp_axis = 0, 1
     mesh_shape = tuple(mesh_device.shape)
-    chunk = 5120
+    # _X4_STEPS is written for 5k chunks; scale its starts so 2k chunks keep the same long/short/rotated pattern.
+    steps = [(user, start * chunk // 5120) for user, start in _X4_STEPS]
     seq_len_cache = 4 * chunk
     config.max_seq_len = seq_len_cache
     num_layers, num_users = 3, 2
@@ -2045,7 +2049,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     # Eager reference on a fresh cache.
     eager = []
     cache_eager = new_cache()
-    for step, (user, start) in enumerate(_X4_STEPS):
+    for step, (user, start) in enumerate(steps):
         set_step(user, start)
         poison(step)
         outs = forward_all(cache_eager, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
@@ -2057,7 +2061,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     # intermediate buffers and be overwritten by a later replay.
     cache_sp = new_cache(tp_sharded=False)
     tt_hidden = [to_device(host_hidden(0, layer)) for layer in range(num_layers)]
-    set_step(*_X4_STEPS[0])
+    set_step(*steps[0])
     # Compile the sp_only programs now too (writing step 0's rows of the replicated cache, as its pass will again), so
     # nothing is compiled -- kernel binaries are allocated -- while the trace is alive.
     for mla_layer in layers:
@@ -2088,7 +2092,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
 
     def replay(steps, poison_base):
         for step in steps:
-            user, start = _X4_STEPS[step]
+            user, start = steps[step]
             set_step(user, start)
             for layer in range(num_layers):
                 ttnn.copy_host_to_device_tensor(
@@ -2108,13 +2112,13 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                 )
 
     try:
-        replay(range(len(_X4_STEPS)), poison_base=100)
+        replay(range(len(steps)), poison_base=100)
 
         # The same steps eagerly on the TP-replicated cache: the TP-sharded layer and cache indexing must give the same
         # output.
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(False)
-        for step, (user, start) in enumerate(_X4_STEPS):
+        for step, (user, start) in enumerate(steps):
             set_step(user, start)
             outs = forward_all(cache_sp, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
             for layer in range(num_layers):
@@ -2132,7 +2136,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
         # runtime arguments) and then the same capture replayed again must still match.
         for mla_layer in layers:
             mla_layer.set_tp_shard_kv(True)
-        for step, (user, start) in enumerate(_X4_STEPS):
+        for step, (user, start) in enumerate(steps):
             set_step(user, start)
             poison(300 + step)
             outs = forward_all(cache_eager, [to_device(host_hidden(step, layer)) for layer in range(num_layers)])
@@ -2143,7 +2147,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
                 ), f"eager tp_sharded after sp_only: step {step} layer {layer}"
             for out in outs:
                 ttnn.deallocate(out)
-        replay(range(len(_X4_STEPS)), poison_base=200)
+        replay(range(len(steps)), poison_base=200)
         assert (
             mesh_device.num_program_cache_entries() == program_entries
         ), "a program compiled while the trace was alive"
@@ -2165,9 +2169,9 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     nat_eager, nat_traced, nat_sp = natural(cache_eager, True), natural(cache_traced, True), natural(cache_sp, False)
     assert torch.equal(nat_traced, nat_eager), "traced and eager TP-sharded caches differ"
     assert torch.equal(nat_sp, nat_eager), "TP-replicated and TP-sharded caches differ"
-    # Every slot is written, and rows past user 1's extent (12800) are written only in user 0's slots (user 0 writes to
-    # 20480): a transposed (layer, user) slot mapping would put user 0's rows into a user-1 slot.
-    user1_end = max(start for user, start in _X4_STEPS if user == 1) + chunk
+    # Every slot is written, and rows past user 1's extent (12800 at 5k chunks) are written only in user 0's slots
+    # (user 0 writes to 20480): a transposed (layer, user) slot mapping would put user 0's rows into a user-1 slot.
+    user1_end = max(start for user, start in steps if user == 1) + chunk
     for user in range(num_users):
         for layer in range(num_layers):
             slot = user * num_layers + layer
@@ -2175,7 +2179,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
             tail = nat_eager[slot, user1_end:].abs().sum()
             assert (tail == 0) == (user == 1), f"user {user} layer {layer}: rows past {user1_end} in the wrong slot"
     logger.success(
-        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(_X4_STEPS)} "
+        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(steps)} "
         f"steps x {num_layers} layers, replayed again after the sp_only pass"
     )
 
@@ -2581,6 +2585,105 @@ def _check_expanded_k_vs_absorbed(
             ref_expanded >= ref_absorbed - 0.001
         ), f"user {u}: expanded K PCC {ref_expanded} < absorbed {ref_absorbed} - 0.001"
         assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"user {u}: expanded K vs absorbed PCC {pcc}"
+
+
+# 2k chunks (256 rows per chip; q128 head pairs, docs/expanded_k/STATUS.md): partial and rotated chunks, a preloaded
+# prefix with a short chunk between full ones, and two users in their own slots.
+_EXPANDED_K_2K_SCENARIOS = [
+    ("c2k-maxedge", dict(iters_isl=[1024, 1056, 2048], chunk_size_global=2048)),
+    ("c2k-prefix", dict(iters_isl=[2048, 1024, 2048], prefill_len=10240, chunk_size_global=2048)),
+    ("c2k-2u", dict(iters_isl=[1024, 2048] * 2, num_users=2, chunk_size_global=2048)),
+]
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("kwargs", [pytest.param(kw, id=sid) for sid, kw in _EXPANDED_K_2K_SCENARIOS])
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.parametrize("tp_shard_kv", [False, True], ids=["sp_only", "tp_sharded"])
+@pytest.mark.timeout(0)
+def test_mla_expanded_k_matches_absorbed_2k(
+    request, mesh_device, device_params, kwargs, variant, use_metadata_tensor, tp_shard_kv, monkeypatch
+):
+    """test_mla_expanded_k_matches_absorbed at 2k chunks, on the table's q128 schedule."""
+    _check_expanded_k_vs_absorbed(
+        request, mesh_device, device_params, kwargs, use_metadata_tensor, tp_shard_kv, monkeypatch, q_chunk=128
+    )
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "variant", ["kimi_k2_7", "kimi_k3", "mistral_small_4"], indirect=True, ids=["k2_7", "k3", "mistral4"]
+)
+@pytest.mark.parametrize("env", [None, "0", "1"], ids=["unset", "off", "on"])
+@pytest.mark.timeout(0)
+def test_mla_expanded_k_default_selection(request, mesh_device, device_params, variant, env, monkeypatch):
+    """Expanded K is on by default where a measured schedule exists (Kimi) and silently off elsewhere (Mistral, latent
+    256); PREFILL_MLA_EXPANDED_K=0 turns it off, and =1 warns when it cannot apply."""
+    if env is None:
+        monkeypatch.delenv("PREFILL_MLA_EXPANDED_K", raising=False)
+    else:
+        monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", env)
+    warnings = []
+    warning = logger.warning
+
+    def recording_warning(message, *args, **kwargs):
+        warnings.append(str(message))
+        return warning(message, *args, **kwargs)
+
+    monkeypatch.setattr(logger, "warning", recording_warning)
+    recorder = _SdpaRecorder(monkeypatch)
+    _run_chunked_prefill(
+        request,
+        mesh_device,
+        reference=None,
+        topology=per_axis_topology(device_params["fabric_config"]),
+        iters_isl=[5120],
+    )
+    supported = variant.name != "mistral_small_4"
+    assert recorder.calls and all(c["expanded"] == (supported and env != "0") for c in recorder.calls)
+    declined = [w for w in warnings if "PREFILL_MLA_EXPANDED_K ignored" in w]
+    assert bool(declined) == (env == "1" and not supported), declined
+
+
+# Unrolled-V accuracy floor (docs/expanded_k/STATUS.md): the V expansion accumulates in fp32 at HiFi4. Accumulated in
+# bf16 at HiFi2 it scored K3 0.99322 and K2.7 0.99637 here (main's ring_mla 0.99805 / 0.99738; fp32 0.99826 / 0.99749),
+# and the harness's own 0.98 checks would not notice.
+_UNROLLED_V_MIN_PCC = {"kimi_k3": 0.9978, "kimi_k2_7": 0.9970}
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
+@pytest.mark.timeout(0)
+def test_mla_unrolled_v_accuracy_floor(request, mesh_device, device_params, variant, expanded_k, monkeypatch):
+    monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
+    _, pccs = _run_chunked_prefill(
+        request,
+        mesh_device,
+        reference="cpu",
+        topology=per_axis_topology(device_params["fabric_config"]),
+        iters_isl=[5120, 5120],
+        prefill_len=10240,
+        use_metadata_tensor=True,
+        return_outputs=True,
+        return_pccs=True,
+    )
+    floor = _UNROLLED_V_MIN_PCC[variant.name]
+    logger.info(f"{variant.name} expanded_k={expanded_k}: output PCC vs CPU reference {pccs[0]:.6f} (floor {floor})")
+    assert pccs[0] >= floor, f"output PCC {pccs[0]} < {floor}"
 
 
 # Schedules outside the measured table (forced here): no K split with one Q chunk per core (q160/k256, every core

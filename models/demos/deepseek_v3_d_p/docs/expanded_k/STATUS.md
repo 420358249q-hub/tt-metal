@@ -180,7 +180,15 @@ Measured at the author's request, as input for optimisation, not as a gate.
    (worst layer 0.98587, bar 0.98): it runs non-chunked attention, which expanded K does not touch.
    **Head groups of 4: dropped (author, 2026-10-18).** Today's schedules use pairs, and groups of 4 would only help
    4-Q-chunk-per-head schedules that neither Kimi model runs.
-5. Phase 4: **default on for Kimi** (author, 2026-10-18), with 2k-chunk schedules (K3 q128 / k256 / 2, K2.7 q128 / k256
+5. Phase 4 (open until E5 passes): **default on for Kimi** (author, 2026-10-18), with 2k-chunk schedules (K3 q128 / k256 / 2, K2.7 q128 / k256
    / 3, from a 512k HiFi2 sweep). Still to do: the E5 regression set on the new default.
 6. The unrolled-V accuracy gap against main's `ring_mla` (0.001 on K2.7 to 0.005 on K3, found in the perf matrix) is
-   fixed in `71e49173813`: the V expansion accumulates in fp32 at HiFi4.
+   fixed in `71e49173813`: the V expansion accumulates in fp32 at HiFi4. CPU reference, 10k prefix + two 5k chunks,
+   HiFi2 SDPA: K3 0.99322 → 0.99826 (expanded K 0.99828; main 0.99805), K2.7 0.99637 → 0.99749 (main 0.99738). The
+   512k forward costs +1.2% (K3 61.79 → 62.52 ms) and +0.6% (K2.7 42.84 → 43.11 ms). bf8 storage of V was not the
+   cause, so `ring_joint` needs no mixed-dtype support.
+7. Perf targets now stale with expanded K on by default (K3 shapes at 640 rows per chip):
+   - Galaxy: `K3_CHUNKED_RT_PERF_NS` (`test_mla.py`) and `perf/test_mla_perf.py`'s K3 / K2.7 targets. Re-baselining
+     here.
+   - LoudBox / QuietBox: `kimi_k3/test_mla_perf.py` `PERF_TARGETS`. These need re-measuring on those boxes; this
+     Galaxy can't.
