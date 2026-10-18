@@ -1,0 +1,54 @@
+diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
+index 404d19ee0f5..6102eef1849 100644
+--- a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
++++ b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_streaming.hpp
+@@ -137,6 +137,10 @@ struct MaybeProfileScope<true, timer_id> : kernel_profiler::profileScope<timer_i
+ #define MaybeDeviceZoneScopedN(ENABLED, name)
+ #endif
+ 
++// SCRATCH utilisation probe: tile-matmul counts for the sum zones.
++uint32_t g_expk_mm_tiles = 0;
++uint32_t g_qk_mm_tiles = 0;
++
+ // --- Outlined out-of-order pack (code-size) ---
+ // pack_tile<true>() (absolute-address pack) inlines the full
+ // llk_pack -> program_packer_destination GPR->FLOP address-programming sequence at every
+@@ -1448,6 +1452,9 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
+ 
+     // K_h no-PE tile (kt, r) = sum_d latent (kt, d) @ W_UK (r, d)^T, for this core's rows.
+     matmul_init(cb_kt_in, cb_wuk, /*transpose=*/1);
++    {
++    DeviceZoneScopedSumN1("EXPK-MM");
++    g_expk_mm_tiles += own_rows * Sk_chunk_t * latent_rows;
+     for (uint32_t r = 0; r < own_rows; ++r) {
+         for (uint32_t kt = 0; kt < Sk_chunk_t; ++kt) {
+             tile_regs_acquire();
+@@ -1463,6 +1470,7 @@ static void sdpa_expand_k_chunk(const uint32_t rank = 0) {
+             tile_regs_release();
+         }
+     }
++    }
+     if constexpr (grouped) {
+         CircularBuffer(cb_own).push_back(own_rows * Sk_chunk_t);
+     }
+@@ -1698,7 +1706,8 @@ static void sdpa_inner_loop_step(
+                 sdpa_mm_reinit(cb_q_in, cb_kt_in, true, actual_sbw, qkt_subblock_h, in0_block_w);
+             }
+             {
+-                MaybeDeviceZoneScopedN(profiling_enabled, "Q@KT MM+Pack");
++                DeviceZoneScopedSumN2("QK-MM");
++                g_qk_mm_tiles += qkt_subblock_h * actual_sbw * in0_block_w;
+                 blocked_matmul_and_pack<true, KT_stride, KT_stride>(
+                     cb_q_in,
+                     cb_kt_in,
+diff --git a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/ring_joint_sdpa.cpp b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/ring_joint_sdpa.cpp
+index 4c768eb3823..5ba7340b462 100644
+--- a/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/ring_joint_sdpa.cpp
++++ b/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/ring_joint_sdpa.cpp
+@@ -901,4 +901,6 @@ void kernel_main() {
+             }
+         }
+     }
++    DeviceTimestampedData("EXPK-N", (uint64_t)g_expk_mm_tiles);
++    DeviceTimestampedData("QK-N", (uint64_t)g_qk_mm_tiles);
+ }

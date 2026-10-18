@@ -42,8 +42,8 @@ The rest of the change:
 | | Criterion | Status | Evidence |
 |---|---|---|---|
 | E1 | Op correctness vs un-absorbed reference | ◐ | `test_ring_joint_expanded_k_per_head_vs_reference`: one chunk at position 0, full or valid-rows-only (2560 tokens; at position 0 this adds the unwritten pad rows, not partial-chunk masking) × `sp_only` / `tp_sharded` (single-slot K) × scalar / metadata × K2.7 / K3 × absorbed / expanded. The SDPA output per (query chip, head) is compared with fp32 attention on its own inputs: 32/32, min PCC 0.99951 (gate 0.999), max abs error ≤ 0.053, finite. Rotated starts and cache-hit sequences are checked only against absorbed on the device: per (device, head) PCC ≥ 0.99962 over rotated, multi-user and partial scenarios and forced schedules. Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights`. **Phase 2** (pairs exchanging rows): E1 32/32, per (device, head) vs absorbed ≥ 0.99968 over 40 runs, schedules 16/16, distinct weights 2/2. Non-chunked causal (per-Q skip with pairs, no K split): `test_ring_joint_expanded_k_causal_vs_reference` 4/4, min PCC 0.99948. Forced pairs without a K split (q320/k256, 1 split) in the schedule test |
-| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet. **Phase 2:** X2 `expanded_k` bitwise `tp_sharded` == `sp_only` 36/36 (rot, maxedge, fullchunk) |
-| E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k; SDPA compute-bound | ◐ | **Timing met.** Phase 2, steady-state traced, `sp_only` vs absorbed: K3 512k −23.8%, K2.7 256k −25.1%, K3 50k −20.7%, K2.7 50k −22.7%; `tp_sharded` with the prefetch is within ±1% of `sp_only` (table below), one run each. **Ring vs compute, partly measured:** the ring K+V gather run alone (same ring and links, no compute, no contention) takes 22.65 ms at K3 512k and 8.20 ms at K2.7 256k, 53% and 56% of the expanded SDPA program (42.35 / 14.74 ms, below). The gather's own time is about half the compute's, but this does not prove it is hidden inside the fused program; per-RISC wait time is still not split out, so this part of E3 stays open. The SDPA program (realtime profiler) drops 17–18% when only its matmuls go to LoFi (K3 512k 42.35 → 34.86 ms, K2.7 256k 14.74 → 12.18 ms, one run each), so compute is on the critical path and the program is not ring-gather-bound. It does not separate exposed exchange or gather waits from compute (LoFi also speeds the expansion). Method: `test_mla.py`'s profile mode with `num_cache_layers=3`, `ttMLA.sdpa_matmul_fidelity` set to LoFi after construction (a local scratch harness) |
+| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix is not run yet. **Model level, Phase 2 kernel, with weights:** K3 golden trace (KIMI_K3_HF_MODEL, 14 passed per mode), full measured output PCC 0.999579 expanded vs 0.999524 absorbed; X2 golden bitwise 4/4. K2.7 transformer `test_kimi_prefill_transformer_chunked_padded` (L10, mid15k, `tp_sharded`, prefetch on, traced and untraced): both pass; over 54 per-layer decoder checks min PCC 0.994921 expanded vs 0.995063 absorbed (−0.00014), min nPCC 0.997048 vs 0.996934, KV cache min PCC 0.994869 vs 0.994724. **Phase 2:** X2 `expanded_k` bitwise `tp_sharded` == `sp_only` 36/36 (rot, maxedge, fullchunk) |
+| E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k; SDPA compute-bound | ◐ | **Timing met.** Phase 2, steady-state traced, `sp_only` vs absorbed: K3 512k −23.8%, K2.7 256k −25.1%, K3 50k −20.7%, K2.7 50k −22.7%; `tp_sharded` with the prefetch is within ±1% of `sp_only` (table below), one run each. **Ring vs compute, partly measured:** the ring K+V gather run alone (same ring and links, no compute, no contention) takes 22.65 ms at K3 512k and 8.20 ms at K2.7 256k, 53% and 56% of the expanded SDPA program (42.35 / 14.74 ms, below). The gather alone is about half the fused program's elapsed time (which itself includes any exposed waits), but this does not prove it is hidden inside the fused program; per-RISC wait time is still not split out, so this part of E3 stays open. The SDPA program (realtime profiler) drops 17–18% when only its matmuls go to LoFi (K3 512k 42.35 → 34.86 ms, K2.7 256k 14.74 → 12.18 ms, one run each), so compute is on the critical path and the program is not ring-gather-bound. It does not separate exposed exchange or gather waits from compute (LoFi also speeds the expansion). Method: `test_mla.py`'s profile mode with `num_cache_layers=3`, `ttMLA.sdpa_matmul_fidelity` set to LoFi after construction (a local scratch harness) |
 | E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet. **Phase 2:** X4 4/4 with allocation tracking |
 | E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 `absorbed` passes (with per-layer weight scaling added for E4) |
 | E6 | Two reviews per commit | ✅ | Every expanded-K code and doc commit, Phase 1 (`c19695fd7b5`) and Phase 2 (`69f2c38e874`) through `3124e893b07`, reviewed by both; findings fixed or answered in `reviews/`. The final commit only adds the last review's log |
@@ -105,7 +105,7 @@ schedule:
   MACs, worth 19.71 − 12.49 = 7.2 ms. That puts the expansion at ≲ 95% of QK's MAC throughput, but only as an upper
   bound: the 7.2 ms also includes the narrower Q read and other non-MAC savings.
   - **Lower end:** a peak-based estimate (HiFi2, about 2 k MACs per cycle per core, 200–340 K chunks per core) puts
-    the expansion at roughly 30–50% of FPU peak, against QK's ≈ 70% math utilisation. That ratio is roughly
+    the expansion at roughly 30–50% of FPU peak, against an assumed ≈ 70% for QK (the measurement below puts QK at about the nominal HiFi2 rate). That ratio is roughly
     0.43–0.71.
   - **Superseded by the Phase 2 measurement below** (0.74–0.81 of QK's rate). The peak-based estimate was too
     low: it assumed about 2 k MACs per cycle at HiFi2, which is the LoFi rate.
@@ -138,19 +138,30 @@ Measured at the author's request, as input for optimisation, not as a gate.
 | K2.7 256k | 43.8 cycles (42.5–45.2) | 32.3 | 0.74 | 19.7% | 27.4% | 14.46 ms |
 
 **What it says:**
-- **QK runs at the FPU's HiFi2 rate.** 32 cycles per tile is two fidelity passes of 16; BH is about 2 k LoFi MACs
-  per cycle. Inside its zone QK has no headroom left.
-- **The expansion runs at 74–81% of that rate.** It would have cleared the waived 60% floor. Its extra 7–12 cycles
-  per tile are the single-tile structure: one output tile per `tile_regs_acquire`, both operands re-unpacked for
-  every tile, and one or two single-tile packs per 16 matmuls. The pack thread spends 37–41 cycles per expansion
-  tile in the same zone, so pack keeps pace and is not the limit.
+- **QK runs at about the nominal HiFi2 rate.** 32 cycles per tile matches two fidelity passes of 16 cycles, taking
+  BH's nominal ≈ 2 k LoFi MACs per cycle. That is an inference from the nominal rate, not a measured peak. The QK
+  zone wraps each subblock call, so profiler overhead is inside the 32.1.
+- **The expansion runs at 74–81% of QK's rate.** It would have cleared the waived 60% floor.
+- **Likely cause of the extra 7–12 cycles per tile (a hypothesis):** the single-tile structure.
+  - One output tile per `tile_regs_acquire`.
+  - Both operands unpacked again for every tile matmul.
+  - One or two single-tile packs per 16 matmuls.
+  - Not separated: the unpack thread reported no expansion sum, and both math and pack zones include
+    synchronisation waits (`tile_regs_acquire` / `tile_regs_wait`). So pack backpressure is not ruled out. The pack
+    thread's 37–41 cycles is per tile matmul in the same zone, mostly waiting.
 - **Ceiling for a blocked expansion matmul**, at QK's rate: 18.2% × (1 − 32.1/39.5) = 3.4% of the SDPA kernel at K3
   512k (≈ 1.4 ms), 19.7% × (1 − 32.3/43.8) = 5.2% at K2.7 256k (≈ 0.75 ms).
-- **Larger levers**, since the expansion's MAC count is now the cost (≈ 18–20% of the SDPA kernel at full rate):
+- **Larger levers**, since the expansion's MAC count is now the cost (18–20% of the SDPA kernel today, ≈ 15% at
+  QK's rate):
   - The expansion matmul at LoFi only. LoFi for all SDPA matmuls cut the program by 17–18%. It would need E1/E2 again.
-  - Groups of 4 (each core expands 1 of 4 no-PE rows). This halves the expansion again, on schedules with 4 Q-chunk
-    cores per head.
-- **Not covered:** the k_pe and peer-row copies, and stalls outside the zones.
+  - Groups of 4 (each core expands 1 of 4 no-PE rows). This halves the per-core expansion again (≈ 7–10% of the
+    kernel at best), on schedules with 4 Q-chunk cores per head. But the kernel supports pairs only, the wider
+    exchange is not costed, and K3's 4-core schedule was 11.5% slower in Phase 1.
+- **Not covered:** the k_pe and peer-row copies, and stalls outside the zones. The kernel times here come from one
+  eager, profiled layer (42.48 / 14.46 ms); E3's 42.35 / 14.74 ms are realtime-profiler times from traced
+  steady-state runs.
+- **Reproduce:** `probes/` holds the probe patch, the harness (copy it to `tests/` to run) and the analysis script
+  (`expk_util_analyze.py profile_log_device.csv`).
 
 ## Next steps
 
@@ -158,10 +169,10 @@ Measured at the author's request, as input for optimisation, not as a gate.
 2. E1: an fp32 reference for rotated starts and short → long → short sequences (today checked only against absorbed).
 3. E4: trace the prefetch-off case too.
 4. Phase 3: the chunk retune is done and `_EXPANDED_K_SDPA_CHUNKS` is unchanged. Steady-state traced `sp_only`
-   forward, one run each (the Phase 2 column above is the first row of each):
+   forward, one run each (the first row of each is the Phase 2 column's configuration, a separate run):
    - K3 512k: q320 / k256 / 2 splits 47.09 ms; k128 / 2 splits 53.74; k256 / 1 split 82.73.
    - K2.7 256k: q320 / k256 / 3 splits 16.55 ms; k128 / 3 splits 18.72; k256 / 2 splits 22.61.
 
-   Still to do: head groups of 4 (other schedules); model-level runs with weights (golden trace, transformer tests)
-   with `PREFILL_MLA_EXPANDED_K=1`.
+   Model-level runs with weights are done for the K3 golden trace and the K2.7 transformer test (E2). Still to do:
+   head groups of 4 (other schedules); the K3 transformer test.
 5. Phase 4: default on for Kimi (E5 regression set), docs.
