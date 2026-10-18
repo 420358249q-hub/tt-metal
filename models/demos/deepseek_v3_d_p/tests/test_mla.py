@@ -762,6 +762,8 @@ def _run_chunked_prefill(
         # None, not False: False would turn off a sparse variant's dedup.
         tp_shard_kv=True if tp_shard_kv else None,
     )
+    # The TP latent prefetch's sub-device manager must not outlive the mesh, whatever the outcome.
+    request.addfinalizer(mla_tt.release_sparse_mla_overlap_manager)
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
     indexed_rope = rope_setup.get_rope_tensors_indexed(
         # tail_slack: an overrunning iteration still ropes its whole padded slab, so the table needs one
@@ -1062,8 +1064,6 @@ def _run_chunked_prefill(
         ttnn.synchronize_device(mesh_device)
         ttnn.distributed_context_barrier()
 
-    # The TP latent prefetch's sub-device manager must not outlive the mesh.
-    mla_tt.release_sparse_mla_overlap_manager()
     if profile:
         return profiled_ns
     if trace_time:
@@ -2206,6 +2206,8 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
         )
         for layer in range(num_layers)
     ]
+    # The TP latent prefetch's sub-device manager must not outlive the mesh, whatever the outcome.
+    request.addfinalizer(layers[0].release_sparse_mla_overlap_manager)
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
     rope = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=seq_len_cache, chunk_size_global=chunk)
     scale_buf = rope_setup.make_llama4_scale_buffer(chunk)
@@ -2338,17 +2340,26 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
     for name in ("serial", "prefetch"):
         assert torch.equal(natural(caches[name], True), nat_sp), f"{name} cache differs from sp_only"
 
-    # A prefetch never outlives its chain or a layout change: layer 0 then layer 1 in separate chains (the caller may
-    # have rewritten the metadata in between), or across set_tp_shard_kv, must gather serially.
+    # A prefetch never outlives its chain or a layout change, so these must gather serially and match the serial path
+    # bit for bit (the caches are equal, and re-running a step rewrites its rows with the same data):
+    #   - layer 0 for user 0, the metadata rewritten in place for user 1, then layer 1 in a new chain;
+    #   - layer 0 with prefetch on (buffer 1 pending), prefetch turned off, then layer 1 (which now reads buffer 0).
+    def layer1_serial(step):
+        set_layout(True, prefetch=False)
+        out = run(caches["serial"], step, layers_to_run=[1])[0]
+        set_layout(True, prefetch=True)
+        return out
+
     consumed.clear()
     run(caches["prefetch"], 0, layers_to_run=[0])
-    run(caches["prefetch"], 0, layers_to_run=[1])
+    got = run(caches["prefetch"], 3, layers_to_run=[1])[0]
+    assert torch.equal(got, layer1_serial(3)), "layer 1 for user 1 after layer 0 for user 0 in another chain"
     with layers[0].tt_ccl.tp_latent_prefetch_chain():
         run_layers(caches["prefetch"], 0, None, [0])
-        set_layout(True, prefetch=True)
-        run_layers(caches["prefetch"], 0, None, [1])
+        set_layout(True, prefetch=False)
+        got = run_layers(caches["prefetch"], 0, None, [1])[0]
+    assert torch.equal(got, layer1_serial(0)), "layer 1 after prefetch was turned off with a prefetch pending"
     assert consumed == [], f"a prefetch was consumed across a chain boundary or a layout change: layers {consumed}"
-    layers[0].release_sparse_mla_overlap_manager()
     logger.success(
         f"✓ prefetch == serial == sp_only, outputs and caches bitwise, over {len(_PREFETCH_STEPS)} steps x "
         f"{num_layers} layers; layers 1..{num_layers - 1} consumed their prefetch on every step"

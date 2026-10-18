@@ -45,7 +45,7 @@ rev 3.
   Otherwise the overlap isn't merged. Outcome (§4.4 rev 5): met at K3 50k, K3 512k and K2.7 256k. K2.7 50k stays at
   +1.2% mean (serial +1.7% mean): the gather there is fixed latency that concurrency does not hide. **Open decision
   for the author:** the overlap is committed on by default as a deliberate exception to this rule, since it is not slower
-  than serial on average anywhere and removes 0.5–1.4 pp at 256k–512k. The alternative is opt-in
+  than serial on average anywhere and removes ≈0.8–1.4 pp (means) at 256k–512k. The alternative is opt-in
   (`PREFILL_TP_LATENT_PREFETCH`).
 
 **Stop and re-plan if:**

@@ -580,9 +580,10 @@ class TtPrefillTransformer(LightweightModule):
             ), f"first layer {self.first_layer_idx} must be 'full' to seed indexer reuse, got '{self.indexer_types[self.first_layer_idx]}'"
         indexer_indices = None
         # Consecutive layers of one chunk: a dense tp_shard_kv MLA layer prefetches the next layer's TP latent during its
-        # SDPA. A kv_only last layer runs no attention, so nothing prefetches for it.
+        # SDPA. Nothing prefetches past this loop's last attention layer: a kv_only last layer runs no attention, and the
+        # MTP cache slots (after the trunk's) are filled after the chain closes.
         with get_tt_ccl(self.mesh_device).tp_latent_prefetch_chain(
-            stop_layer=len(self.layers) - 1 if self.kv_only_last_layer else None
+            stop_layer=len(self.layers) - (1 if self.kv_only_last_layer else 0)
         ):
             for i, layer in enumerate(self.layers):
                 signpost(f"forward_layer_{i}_start")
