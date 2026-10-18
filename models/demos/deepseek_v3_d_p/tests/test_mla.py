@@ -785,7 +785,7 @@ def _run_chunked_prefill(
         else:  # None -> functional / perf, no reference
             torch.manual_seed(100 + u)
             # Random rows only past the prefix: a 512k prefix would otherwise draw ~3.8G values on the host (about two
-            # minutes). A gather that reaches back into the prefix reads zeros; this mode compares with no reference.
+            # minutes). Gathered positions are all >= kv_actual >= prefill_len, so the zero prefix rows are never read.
             hidden = torch.zeros(total_len, hidden_size, dtype=torch.bfloat16)
             hidden[prefill_len:] = torch.randn(total_len - prefill_len, hidden_size, dtype=torch.bfloat16)
             ref_out, ref_kvpe = None, None
