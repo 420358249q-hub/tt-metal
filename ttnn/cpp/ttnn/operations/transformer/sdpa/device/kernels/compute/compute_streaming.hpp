@@ -1394,6 +1394,79 @@ inline bool sdpa_packed_first_half_unmasked(
 }
 
 /**
+ * MLA expanded K: turn one latent K^T chunk into the per-head K^T chunk the QK reads.
+ *
+ * cb_kt_in holds the latent [c_kv | k_pe] as plain tiles in K^T tile order (tile (d, kt) at d * Sk_chunk_t + kt; the
+ * reader's transposed fetch reorders tiles, and the QK transposes in-tile through its in1-transpose flag). cb_wuk holds
+ * W_UK of this core's head, [no-PE rows x latent cols] tile-row-major. The result keeps the same contract, so the QK
+ * runs unchanged at DHt_qk: rows [0, nope_rows) are K_h no-PE tiles, c_kv @ W_UK^T (W_UK's tiles transposed in-tile by
+ * the same matmul flag), and rows [nope_rows, DHt_qk) are the latent's k_pe tiles, copied. Pops cb_kt_in, pushes
+ * cb_kexp.
+ *
+ * Unpack/pack formats: entered and left in the state sdpa_inner_loop_step assumes on entry (srcA cb_qkt_im, srcB
+ * cb_identity_scale_in, pack cb_normalized_out). Matmul maps in0 to srcB and in1 to srcA.
+ */
+template <
+    uint32_t Sk_chunk_t,
+    uint32_t DHt_k,
+    uint32_t DHt_qk,
+    uint32_t latent_rows,
+    uint32_t cb_kt_in,
+    uint32_t cb_wuk,
+    uint32_t cb_kexp,
+    uint32_t cb_qkt_im,
+    uint32_t cb_identity_scale_in,
+    uint32_t cb_normalized_out>
+static void sdpa_expand_k_chunk() {
+    constexpr uint32_t pe_rows = DHt_k - latent_rows;
+    static_assert(DHt_qk > pe_rows, "expanded K needs no-PE rows");
+    constexpr uint32_t nope_rows = DHt_qk - pe_rows;
+
+    CircularBuffer(cb_kt_in).wait_front(DHt_k * Sk_chunk_t);
+    CircularBuffer(cb_wuk).wait_front(nope_rows * latent_rows);
+    CircularBuffer(cb_kexp).reserve_back(DHt_qk * Sk_chunk_t);
+
+    reconfig_data_format(cb_qkt_im, cb_wuk, cb_identity_scale_in, cb_kt_in);
+    pack_reconfig_data_format(cb_normalized_out, cb_kexp);
+    configure_single_tile_pack(cb_kexp);
+
+    // K_h no-PE tile (kt, r) = sum_d latent (kt, d) @ W_UK (r, d)^T.
+    matmul_init(cb_kt_in, cb_wuk, /*transpose=*/1);
+    for (uint32_t r = 0; r < nope_rows; ++r) {
+        for (uint32_t kt = 0; kt < Sk_chunk_t; ++kt) {
+            tile_regs_acquire();
+            for (uint32_t d = 0; d < latent_rows; ++d) {
+                matmul_tiles(cb_kt_in, cb_wuk, d * Sk_chunk_t + kt, r * latent_rows + d, 0);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile<true>(0, cb_kexp, r * Sk_chunk_t + kt);
+            tile_regs_release();
+        }
+    }
+
+    // The shared k_pe rows, as they are.
+    reconfig_data_format_srca(cb_wuk, cb_kt_in);
+    copy_init(cb_kt_in);
+    for (uint32_t p = 0; p < pe_rows; ++p) {
+        for (uint32_t kt = 0; kt < Sk_chunk_t; ++kt) {
+            tile_regs_acquire();
+            copy_tile(cb_kt_in, (latent_rows + p) * Sk_chunk_t + kt, 0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile<true>(0, cb_kexp, (nope_rows + p) * Sk_chunk_t + kt);
+            tile_regs_release();
+        }
+    }
+
+    CircularBuffer(cb_kexp).push_back(DHt_qk * Sk_chunk_t);
+    sdpa_cb_pop_front_out_of_line(cb_kt_in, DHt_k * Sk_chunk_t);
+
+    reconfig_data_format(cb_kt_in, cb_qkt_im, cb_kt_in, cb_identity_scale_in);
+    pack_reconfig_data_format(cb_kexp, cb_normalized_out);
+}
+
+/**
  * One K-chunk iteration of the streaming SDPA algorithm (v2 — no row buffers).
  * Phase 1: Q@KT directly into cb_qkt_im with cb_push_back_hold_wr_ptr, in-place sub_exp.
  * Phase 2: Drain + QKT@V with SALAD corrections, streaming normalization on last K iter.
@@ -2553,6 +2626,13 @@ template <
     uint32_t kv_region_Nt = q_local_padded_Nt,
     // Split-KV: GROUPED_KV_SOURCE_COUNT > 1. Keeps the per-source path free of packed branches.
     bool packed_kv_enabled = false,
+    // MLA expanded K (k_expand_weight): Q and the QK are DHt_qk tiles wide while cb_kt_in carries the DHt-wide latent;
+    // each processed K chunk is expanded into cb_kexp (sdpa_expand_k_chunk) with the head's W_UK from cb_wuk, which is
+    // popped with Q. Off (INVALID_CB) everywhere else.
+    uint32_t DHt_qk = DHt,
+    uint32_t cb_kexp = INVALID_CB,
+    uint32_t cb_wuk = INVALID_CB,
+    uint32_t k_expand_latent_rows = 0,
     typename MaskCtx = LightweightMaskContext>
 void sdpa_ring_v2(
     const uint32_t global_q_start,
@@ -3125,12 +3205,27 @@ void sdpa_ring_v2(
                 packed_mask = plan.mask;
             }
 
+            // Expanded K: the QK reads the per-head K^T chunk built from this latent chunk.
+            constexpr bool k_expand = cb_kexp != INVALID_CB;
+            if constexpr (k_expand) {
+                sdpa_expand_k_chunk<
+                    Sk_chunk_t,
+                    DHt,
+                    DHt_qk,
+                    k_expand_latent_rows,
+                    cb_kt_in,
+                    cb_wuk,
+                    cb_kexp,
+                    cb_qkt_im,
+                    cb_identity_scale_in,
+                    cb_normalized_out>();
+            }
             sdpa_inner_loop_step<
                 false,  // profiling_enabled
                 Sq_chunk_t,
                 Sk_chunk_t,
                 Skt,
-                DHt,
+                DHt_qk,
                 vDHt,
                 scale_fp32,
                 qkt_subblock_h,
@@ -3141,7 +3236,7 @@ void sdpa_ring_v2(
                 true,                               // ring_mode
                 is_causal_sdpa || chunked_enabled,  // chunked re-enables causal masking with absolute coords
                 cb_q_in,
-                cb_kt_in,
+                k_expand ? cb_kexp : cb_kt_in,
                 cb_v_in,
                 cb_qkt_im,
                 cb_identity_scale_in,
@@ -3218,7 +3313,12 @@ void sdpa_ring_v2(
         // the last pass of the last ring iteration, so nothing is popped here.
         if constexpr (!use_l1_state_fifo) {
             if (q_per_core > 1 || is_last_ring_iter) {
-                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt);
+                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt_qk);
+                // Expanded K: the reader pushes the head's W_UK with every Q push.
+                if constexpr (cb_wuk != INVALID_CB) {
+                    sdpa_cb_pop_front_out_of_line(
+                        cb_wuk, (DHt_qk - (DHt - k_expand_latent_rows)) * k_expand_latent_rows);
+                }
             }
         }
 

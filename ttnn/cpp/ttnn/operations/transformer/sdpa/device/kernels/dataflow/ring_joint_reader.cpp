@@ -243,6 +243,11 @@ void kernel_main() {
     constexpr uint32_t NHK = get_compile_time_arg_val(2);
     constexpr uint32_t DHt = get_compile_time_arg_val(3);
     constexpr uint32_t vDHt = get_compile_time_arg_val(4);
+    // Expanded K: Q is DHt_qk tiles wide while K (the latent) keeps DHt; the reader also pushes the core's head's W_UK
+    // into cb_wuk alongside every Q push. Without it DHt_qk == DHt.
+    constexpr bool k_expand = get_named_compile_time_arg_val("k_expand") == 1;
+    constexpr uint32_t DHt_qk = get_named_compile_time_arg_val("dht_qk");
+    constexpr uint32_t cb_wuk = get_named_compile_time_arg_val("cb_wuk");
     constexpr uint32_t Sq_chunk_t = get_compile_time_arg_val(5);
     constexpr uint32_t Sk_chunk_t = get_compile_time_arg_val(6);
     constexpr uint32_t q_local_padded_Nt = get_compile_time_arg_val(7);
@@ -518,6 +523,12 @@ void kernel_main() {
     constexpr bool ksplit_enabled = ksplit_count > 1;
     static_assert(!ksplit_enabled || !rotated_q_split_enabled);
     [[maybe_unused]] const uint32_t ksplit_idx = ksplit_enabled ? get_arg_val<uint32_t>(rotated_args_base) : 0;
+    // Expanded K: W_UK's address is the last runtime arg, after the rotated-split pairs or the K-split band
+    // (exclusive).
+    [[maybe_unused]] const uint32_t wuk_addr =
+        k_expand ? get_arg_val<uint32_t>(
+                       rotated_args_base + (rotated_q_split_enabled ? 2 * ring_size : 0) + (ksplit_enabled ? 1 : 0))
+                 : 0;
     constexpr uint32_t rotated_iter_stride = kRotatedReaderIterWords;
 
     // Common runtime args: metadata block first when present, then the logical-length pair.
@@ -761,7 +772,7 @@ void kernel_main() {
     const uint32_t kv_batch_dim = indexed_kv_cache ? kv_cache_batch_idx + 1 : B;
     // The fused all-gather wrote the active slot to gathered slot 0, so address it as batch-1.
     const uint32_t gathered_kv_batch_dim = indexed_kv_cache ? 1 : B;
-    const auto input_q_tile_logical = TensorTileShape(B, NH, q_local_padded_Nt, DHt);
+    const auto input_q_tile_logical = TensorTileShape(B, NH, q_local_padded_Nt, DHt_qk);
     // Packed KV: K/V rows can be wider than the head dims; V is the last vDHt columns of its row.
     constexpr uint32_t k_row_Wt = get_named_compile_time_arg_val("k_row_Wt");
     constexpr uint32_t v_row_Wt = get_named_compile_time_arg_val("v_row_Wt");
@@ -774,7 +785,7 @@ void kernel_main() {
     const auto joint_input_tile_logical = TensorTileShape(B, NH, Lt, DHt);
     // Joint Q addressing: per-device shard (Lt_local rows). Equals Lt on the replicated path
     // (Lt_local == Lt when joint is not sharded), so this is bit-identical there.
-    const auto joint_q_input_tile_logical = TensorTileShape(B, NH, Lt_local, DHt);
+    const auto joint_q_input_tile_logical = TensorTileShape(B, NH, Lt_local, DHt_qk);
 
     const auto q_generator = PaddedAddrGenerator(q_reader, input_q_tile_logical);
     const auto local_k_generator = PaddedAddrGenerator(local_k_reader, input_k_tile_logical);
@@ -1059,12 +1070,12 @@ void kernel_main() {
             }
 
             // Default to local Q tensor; override below for joint Q when applicable.
-            Slice q_slice(nb, nq, q_row_start_tile, q_row_start_tile + Sq_chunk_t, 0, DHt);
+            Slice q_slice(nb, nq, q_row_start_tile, q_row_start_tile + Sq_chunk_t, 0, DHt_qk);
             uint32_t q_end_seq_tile = q_local_padded_Nt;
             if constexpr (has_joint_q) {
                 if (is_joint_q) {
                     const uint32_t joint_q_row_start_tile = (q_chunk - num_local_q_chunks) * Sq_chunk_t;
-                    q_slice = Slice(nb, nq, joint_q_row_start_tile, joint_q_row_start_tile + Sq_chunk_t, 0, DHt);
+                    q_slice = Slice(nb, nq, joint_q_row_start_tile, joint_q_row_start_tile + Sq_chunk_t, 0, DHt_qk);
                     // Lt_local: per-device joint-Q shard tile count (== Lt on the replicated path).
                     // joint_q is a local tensor starting at row 0; the mesh tensor tracks which global
                     // prompt slice this device owns, so no ring_id offset is added here.
@@ -1353,7 +1364,7 @@ void kernel_main() {
                             for (uint32_t q_sub = 0; q_sub < q_num_subblocks; ++q_sub) {
                                 const uint32_t sb_row_start = q_slice.d2_start + q_sub * qk_subblock_h;
                                 const uint32_t sb_row_end = sb_row_start + qk_subblock_h;
-                                Slice q_sub_slice(q_slice.d0, q_slice.d1, sb_row_start, sb_row_end, 0, DHt);
+                                Slice q_sub_slice(q_slice.d0, q_slice.d1, sb_row_start, sb_row_end, 0, DHt_qk);
                                 read_block(
                                     q_gen,
                                     q_sub_slice,
@@ -1376,6 +1387,24 @@ void kernel_main() {
                     };
                     read_q_from_source<has_joint_q, joint_tensor_args_offset>(
                         is_joint_q, joint_q_addr, q_generator, joint_q_input_tile_logical, read_q);
+                    if constexpr (k_expand) {
+                        // This Q chunk's head's W_UK, [128, 512] = 4 x 16 tiles, tile-row-major: same lifetime as Q
+                        // (compute pops both together).
+                        constexpr uint32_t wuk_tiles = 4 * 16;
+                        constexpr uint32_t wuk_tile_bytes = get_tile_size(cb_wuk);
+                        const InterleavedAddrGenFast<true> wuk_gen = {
+                            .bank_base_address = wuk_addr,
+                            .page_size = wuk_tile_bytes,
+                            .data_format = get_dataformat(cb_wuk)};
+                        cb_reserve_back(cb_wuk, wuk_tiles);
+                        uint32_t wuk_write_ptr = get_write_ptr(cb_wuk);
+                        for (uint32_t t = 0; t < wuk_tiles; ++t) {
+                            noc_async_read_tile(nq * wuk_tiles + t, wuk_gen, wuk_write_ptr);
+                            wuk_write_ptr += wuk_tile_bytes;
+                        }
+                        noc_async_read_barrier();
+                        cb_push_back(cb_wuk, wuk_tiles);
+                    }
                     q_pushed = true;
                 }
                 first_k_for_q = false;

@@ -1699,15 +1699,18 @@ def test_mla_chunked_perf_check(request, mesh_device, device_params, variant):
 )
 @pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
 @pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
 @pytest.mark.timeout(0)
 def test_mla_chunked_prefill_tp_sharded_matches_sp_only(
-    request, mesh_device, device_params, reference, kwargs, variant, use_metadata_tensor
+    request, mesh_device, device_params, reference, kwargs, variant, use_metadata_tensor, expanded_k, monkeypatch
 ):
     """The TP-sharded cache is read back through a TP latent gather into the TP-replicated layout, and everything
-    downstream is unchanged, so the output must equal the TP-replicated (sp_only) run bit for bit, on the same inputs.
+    downstream is unchanged, so the output must equal the TP-replicated (sp_only) run bit for bit, on the same inputs,
+    with K absorbed or expanded in the SDPA (docs/expanded_k/PLAN.md E2).
     """
     if reference == "trace" and not variant.mla_trace_defaults and not MLA_CHUNKED_TRACE_PATH:
         pytest.skip(f"no golden MLA trace recorded for {variant.name}")
+    monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     topology = per_axis_topology(device_params["fabric_config"])
     outs = {}
     for tp_shard_kv in (False, True):
@@ -2369,11 +2372,20 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
 
     # A chain's stop_layer: nothing prefetches cache layer stop_layer or beyond (a kv_only last layer), so the last
     # layer here gathers serially; the outputs are unchanged.
-    with layers[0].tt_ccl.tp_latent_prefetch_chain(stop_layer=num_layers - 1):
-        outs = run_layers(caches["prefetch"], 0, None, None)
-    assert consumed == list(range(1, num_layers - 1)), f"stop_layer {num_layers - 1}: layers consumed {consumed}"
-    for layer in range(num_layers):
-        assert torch.equal(outs[layer], passes["prefetch"][0][layer]), f"stop_layer chain: layer {layer} differs"
+    # At or past the cache's layer count the stop is the cache's own end (layer_num): every layer but layer 0 consumes.
+    for stop_layer, expected in [
+        (num_layers - 1, list(range(1, num_layers - 1))),
+        (num_layers, list(range(1, num_layers))),
+        (num_layers + 1, list(range(1, num_layers))),
+    ]:
+        consumed.clear()
+        with layers[0].tt_ccl.tp_latent_prefetch_chain(stop_layer=stop_layer):
+            outs = run_layers(caches["prefetch"], 0, None, None)
+        assert consumed == expected, f"stop_layer {stop_layer}: layers consumed {consumed}, expected {expected}"
+        for layer in range(num_layers):
+            assert torch.equal(
+                outs[layer], passes["prefetch"][0][layer]
+            ), f"stop_layer {stop_layer} chain: layer {layer} differs"
     logger.success(
         f"✓ prefetch == serial == sp_only, outputs and caches bitwise, over {len(_PREFETCH_STEPS)} steps x "
         f"{num_layers} layers; layers 1..{num_layers - 1} consumed their prefetch on every step"
@@ -2429,3 +2441,48 @@ def test_tp_latent_prefetch_chain_stop_layer(monkeypatch, kv_only_last_layer):
     transformer.forward(object(), kvpe_cache=object(), actual_isl=0, actual_start=0)
     assert chains == [num_layers - 1 if kv_only_last_layer else num_layers], chains
     assert not active, "the prefetch chain was left open"
+
+
+# Expanded K (docs/expanded_k/PLAN.md E1/E2): K expanded per head inside the SDPA is the same attention as the absorbed
+# latent QK, up to bf8 rounding of the expanded K and of Q's absorbed channels. Both runs check their own PCC against
+# the CPU reference inside the harness; here they must also agree with each other.
+_EXPANDED_K_MIN_PCC_VS_ABSORBED = 0.999
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "kwargs",
+    [pytest.param(kw, id=sid) for sid, kw in _CHUNKED_SCENARIOS if not sid.startswith(("deep", "prod"))],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.parametrize("tp_shard_kv", [False, True], ids=["sp_only", "tp_sharded"])
+@pytest.mark.timeout(0)
+def test_mla_expanded_k_matches_absorbed(
+    request, mesh_device, device_params, kwargs, variant, use_metadata_tensor, tp_shard_kv, monkeypatch
+):
+    """Expanded K vs absorbed K on CPU-reference inputs: each passes the harness's reference PCC, and their outputs
+    agree to _EXPANDED_K_MIN_PCC_VS_ABSORBED per user."""
+    topology = per_axis_topology(device_params["fabric_config"])
+    outs = {}
+    for expanded in (False, True):
+        monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded else "0")
+        outs[expanded] = _run_chunked_prefill(
+            request,
+            mesh_device,
+            reference="cpu",
+            topology=topology,
+            use_metadata_tensor=use_metadata_tensor,
+            tp_shard_kv=tp_shard_kv,
+            return_outputs=True,
+            **kwargs,
+        )
+    for u, (absorbed, expanded) in enumerate(zip(outs[False], outs[True])):
+        assert torch.isfinite(expanded).all(), f"user {u}: non-finite expanded-K output"
+        _, pcc = comp_pcc(absorbed.float(), expanded.float(), _EXPANDED_K_MIN_PCC_VS_ABSORBED)
+        logger.info(f"user {u}: expanded K vs absorbed PCC {pcc}")
+        assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"user {u}: expanded K vs absorbed PCC {pcc}"

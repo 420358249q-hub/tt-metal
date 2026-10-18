@@ -317,6 +317,7 @@ class ttMLA:
         # Optional segmented-trace controller. Sparse MLA uses it to split capture around the
         # top-k/KV-gather sub-device-manager load and clear, which cannot occur inside one trace.
         self._trace_controller = None
+        self._expanded_k = False
         self.layer_idx = layer_idx
         self.kv_only = kv_only
         self.is_balanced = is_balanced
@@ -556,6 +557,12 @@ class ttMLA:
             self.q_b_proj_weight = weights["q_b_proj"]
             self.wkv_b1_weight = weights["wkv_b1"]
             self.wkv_b2_weight = weights["wkv_b2"]
+            # Expanded K (docs/expanded_k/PLAN.md), PREFILL_MLA_EXPANDED_K=1: Q un-absorbed at 192 wide, K expanded per
+            # head inside the SDPA from the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked
+            # unrolled-V only; off by default.
+            self._expanded_k = (
+                self.is_chunked and not self._has_indexer and os.getenv("PREFILL_MLA_EXPANDED_K", "0") == "1"
+            )
             if self.is_chunked and not self._has_indexer:
                 self._init_unrolled_v()
             self.o_proj_weight = weights["o_proj"]
@@ -1262,6 +1269,14 @@ class ttMLA:
     #   Mistral-Small-4 (320, 32): two waves of q128 beside a k640 chunk, 26% faster than three of q64 (the narrower K
     #     leaves room for the larger chunks), forward 7.83 -> 6.14 ms vs ring_mla on the 8x1 LoudBox.
     # Shapes not listed fall back to the model below, which is calibrated on the 576-wide K.
+    # Expanded K (docs/expanded_k/PLAN.md): every core still expands its head's whole K chunk (Phase 1), so fewer cores
+    # per head wins. K3 at q320 runs 2 Q chunks per head in 2 K-split bands (each core expands half the heads' K once per
+    # band slice), 12.5-14.6% under absorbed q160/k512 at 50k-512k; k512 does not fit L1 beside the expanded K^T CB.
+    _EXPANDED_K_SDPA_CHUNKS = {
+        (576, 24, 640): (320, 256, 2),
+        (576, 16, 640): (320, 256, 3),
+    }
+
     _UNROLLED_V_SDPA_CHUNKS = {
         (576, 24, 640): (160, 512, 1),
         (576, 16, 640): (320, 256, 3),
@@ -1291,9 +1306,10 @@ class ttMLA:
         critical-path rows per core (waves x q_chunk / splits) over the chunk's efficiency. A (head, Q chunk) unit takes
         one core; when the units leave whole grid rows idle, ring_joint's K split gives every band of rows a slice of
         the K/V sequence."""
-        measured = self._UNROLLED_V_SDPA_CHUNKS.get(
-            (self.kv_lora_rank + self.qk_rope_head_dim, num_local_heads, seq_len_local)
-        )
+        key = (self.kv_lora_rank + self.qk_rope_head_dim, num_local_heads, seq_len_local)
+        if self._expanded_k and key in self._EXPANDED_K_SDPA_CHUNKS:
+            return self._EXPANDED_K_SDPA_CHUNKS[key]
+        measured = self._UNROLLED_V_SDPA_CHUNKS.get(key)
         if measured is not None:
             return measured
         grid_x, grid_y = self.ring_sdpa_compute_grid
@@ -1438,6 +1454,7 @@ class ttMLA:
                 scale=self.scale,
                 is_balanced=self.is_balanced,
                 **meta_slot_kwargs,
+                **({"k_expand_weight": self.wkv_b1_weight} if self._expanded_k else {}),
                 **kw,
             )
 
@@ -1558,12 +1575,14 @@ class ttMLA:
         )
         ttnn.deallocate(tt_q)
 
-        tt_q_nope = ttnn.linear(
-            tt_q_nope,
-            self.wkv_b1_weight,
-            compute_kernel_config=self.default_compute_kernel_config,
-            **self._get_mm_kwargs("wkv_b1", seq_len_local),
-        )
+        if not self._expanded_k:
+            # Absorbed Q: q_nope @ W_UK (512 wide). Expanded K keeps q_nope (128) and expands K in the SDPA instead.
+            tt_q_nope = ttnn.linear(
+                tt_q_nope,
+                self.wkv_b1_weight,
+                compute_kernel_config=self.default_compute_kernel_config,
+                **self._get_mm_kwargs("wkv_b1", seq_len_local),
+            )
 
         if self._use_indexed_rope:
             # The indexed RoPE writer copies the absorbed channels into the same output.

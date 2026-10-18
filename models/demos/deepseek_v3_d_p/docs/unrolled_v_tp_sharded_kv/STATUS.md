@@ -52,7 +52,8 @@ Milestone: Phases 2 and 3 of [PLAN.md](PLAN.md) (TP latent gather; prefetched du
 | `a167a715772` | Expanded-K plan rev 2 (docs only, [../expanded_k/PLAN.md](../expanded_k/PLAN.md)) | plan reviews (rev 1) in its §8 |
 | `cb503a22535` | Phase 3 round-2 fixes: MTP stop layer, manager release on failure, stronger interruption checks, GLM host-test stub | [log](reviews/cb503a22535.md) |
 | `d340d30ec80` | Phase 3 round-3 fixes: both layout-change variants checked, finalizer before construction, host test of the transformer's stop layer | [log](reviews/d340d30ec80.md) |
-| *(last)* | Phase 3 round-4: device check of a chain's stop layer | **pending** (next step 1) |
+| `7e8c371d91f` | Phase 3 round-4: device check of a chain's stop layer | [log](reviews/7e8c371d91f.md) |
+| *(last)* | Expanded K Phase 1 (`../expanded_k/STATUS.md`); stop-layer clamp check | **pending** |
 
 Each code commit up to `239b41cb8e5` was reviewed by Claude Code and Codex (gpt-6-astra). Every finding is fixed, or
 answered in its log.

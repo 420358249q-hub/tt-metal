@@ -37,6 +37,14 @@ void kernel_main() {
     constexpr uint32_t NH = get_compile_time_arg_val(0);
     constexpr uint32_t DHt = get_compile_time_arg_val(1);
     constexpr uint32_t vDHt = get_compile_time_arg_val(2);
+    // Expanded K (k_expand_weight): Q / QK width DHt_qk; DHt stays the latent K's. W_UK of the core's head arrives in
+    // cb_wuk with every Q push and leaves with every Q pop. The latent's no-PE part is kKExpandLatentRows tile rows.
+    constexpr bool k_expand = get_named_compile_time_arg_val("k_expand") == 1;
+    constexpr uint32_t DHt_qk = get_named_compile_time_arg_val("dht_qk");
+    constexpr uint32_t cb_wuk = get_named_compile_time_arg_val("cb_wuk");
+    constexpr uint32_t cb_kexp = get_named_compile_time_arg_val("cb_kexp");
+    constexpr uint32_t kKExpandLatentRows = 512 / 32;
+    constexpr uint32_t wuk_tiles = k_expand ? (DHt_qk - (DHt - kKExpandLatentRows)) * kKExpandLatentRows : 0;
     constexpr uint32_t Sq_chunk_t = get_compile_time_arg_val(3);
     constexpr uint32_t Sk_chunk_t = get_compile_time_arg_val(4);
     constexpr uint32_t q_local_padded_Nt [[maybe_unused]] = get_compile_time_arg_val(5);
@@ -174,7 +182,7 @@ void kernel_main() {
     RingSDPAOpIndexer fused_op_indexer(
         ring_size_runtime, ring_index_runtime, forward_writes_expected, backward_writes_expected);
 
-    constexpr uint32_t q_chunk_tiles = Sq_chunk_t * DHt;
+    constexpr uint32_t q_chunk_tiles = Sq_chunk_t * DHt_qk;
     constexpr uint32_t k_chunk_tiles = Sk_chunk_t * DHt;
     constexpr uint32_t v_chunk_tiles = Sk_chunk_t * vDHt;
     constexpr uint32_t qk_chunk_tiles = Sq_chunk_t * Sk_chunk_t;
@@ -647,7 +655,11 @@ void kernel_main() {
                 rotated_q_split_enabled,
                 dense_causal_skip,
                 kv_region_Nt,
-                (GROUPED_KV_SOURCE_COUNT > 1)>(
+                (GROUPED_KV_SOURCE_COUNT > 1),
+                DHt_qk,
+                k_expand ? cb_kexp : INVALID_CB,
+                k_expand ? cb_wuk : INVALID_CB,
+                k_expand ? kKExpandLatentRows : 0>(
                 // Rotated: iterate [0, my_count) as POSITIONS, each mapped to its flat chunk id via
                 // the fixed base range or moving remainder ID. Static: [start, end) is already flat.
                 rotated_q_split_enabled ? 0u : global_q_start,
@@ -792,7 +804,10 @@ void kernel_main() {
         if (seg_active) {
             // The reader pushes Q with this core's first K chunk; no ring iteration popped it.
             if (seen_active_iter) {
-                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt);
+                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt_qk);
+                if constexpr (k_expand) {
+                    sdpa_cb_pop_front_out_of_line(cb_wuk, wuk_tiles);
+                }
             }
             ASSERT(seg_state_valid);
             constexpr uint32_t dst_size = compute_kernel_lib::DEST_AUTO_LIMIT;
@@ -822,7 +837,10 @@ void kernel_main() {
             constexpr uint32_t out_tiles = Sq_chunk_t * vDHt;
             // The reader pushes Q with this core's first K chunk.
             if (seen_active_iter) {
-                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt);
+                sdpa_cb_pop_front_out_of_line(cb_q_in, Sq_chunk_t * DHt_qk);
+                if constexpr (k_expand) {
+                    sdpa_cb_pop_front_out_of_line(cb_wuk, wuk_tiles);
+                }
             }
             if (ksplit_idx != ksplit_count - 1) {
                 // Sender: leave the state in half A, where the reducer reads it, and signal the writer. An empty

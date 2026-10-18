@@ -1082,7 +1082,11 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t NH = q_shape[1];
     const uint32_t NHK = k_shape[1];
     const uint32_t NHV = tensor_args.v_num_heads();
-    const uint32_t DH = q_shape[3];
+    // Expanded K (k_expand_weight): Q and the QK run at Q's head dim (DHt_qk); DH is K's, the latent's, which every K
+    // data-movement path and CB keeps. Without it the two are equal.
+    const bool k_expand = tensor_args.has_k_expand();
+    const uint32_t DH_qk = q_shape[3];
+    const uint32_t DH = k_expand ? static_cast<uint32_t>(k_shape[3]) : DH_qk;
     const uint32_t q_local_padded_N = q_shape[2];
     const uint32_t kv_local_padded_N = tensor_args.local_kv_seq_len();
     const uint32_t ring_size = static_cast<uint32_t>(args.all_gather_operation_attributes.ring_size);
@@ -1121,6 +1125,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     // per-ring-iteration joint tail mask, mirroring logical_nt for the spatial path.
     const uint32_t logical_lt = tt::div_up(logical_l, tt::constants::TILE_HEIGHT);
     const uint32_t DHt = DH / tt::constants::TILE_WIDTH;
+    const uint32_t DHt_qk = DH_qk / tt::constants::TILE_WIDTH;
     const uint32_t vDHt = vDH / tt::constants::TILE_WIDTH;
     const bool kv_pad_from_metadata = tensor_args.kv_pad_from_metadata(args.kv_stripe_split);
     const bool kv_pad_rotation_enabled = ttnn::prim::kv_pad_rotation_active(args, tensor_args);
@@ -1349,7 +1354,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const bool kt_inplace_v = kt_inplace_v_enabled(v_shares_k_buffer, Sq_chunk_t);
 
     // These tile capacity counts for CBs need to match the number of tiles expected by the kernel (softmax.cpp)
-    uint32_t q_tiles = Sq_chunk_t * DHt * q_buffer_factor;
+    uint32_t q_tiles = Sq_chunk_t * DHt_qk * q_buffer_factor;
     // Latent-V keeps the K CB triple-buffered. With V rematerialized, the 3rd slot let the reader
     // build the next V while compute consumed the current one; with in-place latent V (kt_inplace_v)
     // there is no V entry, but the 3rd K^T slot still buys prefetch slack that hides the reader's
@@ -1375,7 +1380,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
 
     // Host code is responsible for determining matmul configuration
     const uint32_t dst_size = ttnn::get_dest_reg_count(args.compute_kernel_config);
-    const uint32_t qk_in0_block_w = DHt;
+    const uint32_t qk_in0_block_w = DHt_qk;
     auto [qk_out_subblock_h, qk_out_subblock_w] =
         detail::determine_largest_subblock_size(Sq_chunk_t, Sk_chunk_t, dst_size);
 
@@ -1536,8 +1541,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t sub_exp_granularity = detail::find_valid_granularity(Sk_chunk_t, dst_size);
     // DHT_GRANULARITY is used in the kernel with both DHt and vDHt as the cols parameter,
     // so the granularity must evenly divide both to avoid dropping tiles.
-    uint32_t dht_granularity = std::min({DHt, vDHt, dst_size});
-    while (dht_granularity > 1 && (DHt % dht_granularity != 0 || vDHt % dht_granularity != 0)) {
+    uint32_t dht_granularity = std::min({DHt, DHt_qk, vDHt, dst_size});
+    while (dht_granularity > 1 &&
+           (DHt % dht_granularity != 0 || DHt_qk % dht_granularity != 0 || vDHt % dht_granularity != 0)) {
         dht_granularity--;
     }
     const uint32_t reduce_granularity = detail::find_valid_granularity(Sq_chunk_t, dst_size / 2);
@@ -2077,6 +2083,16 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         use_streaming_compute ? allocate_cb(signal_page_size, 1, tt::DataFormat::UInt16) : inactive_cb;
     // Reader-to-compute mailbox for the metadata-derived logical geometry.
     const uint32_t cb_kv_pad_derived = allocate_cb(64, 1, tt::DataFormat::UInt32);
+    // Expanded K: the core's head's W_UK (pushed and popped with Q, so double-buffered like it) and the assembled
+    // per-head K^T chunk [expanded no-PE rows | latent PE rows] the QK reads (double-buffered).
+    const uint32_t wuk_tiles =
+        (kKExpandNopeDim / tt::constants::TILE_HEIGHT) * (kKExpandLatentDim / tt::constants::TILE_WIDTH);
+    const tt::DataFormat wuk_df =
+        k_expand ? tt::tt_metal::datatype_to_dataformat_converter(tensor_args.k_expand_weight->dtype()) : k_df;
+    // Disabled, they alias live CBs so compile-time tile-size queries in the kernels stay valid (as cb_attention_sink).
+    const uint32_t cb_wuk =
+        k_expand ? allocate_tile_cb(wuk_tiles * q_buffer_factor, tt::tile_size(wuk_df), wuk_df) : cb_q_in;
+    const uint32_t cb_kexp = k_expand ? allocate_tile_cb(DHt_qk * Sk_chunk_t * 2, k_tile_size, k_df) : cb_k_in;
 
     const std::vector<uint32_t> cb_compile_time_args = {
         cb_q_in,     cb_k_in,     cb_v_in,         cb_mask_in,       cb_scale_in,     cb_identity_scale_in,
@@ -3145,6 +3161,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     for (auto* kernel : {&reader_kernel, &writer_kernel, &compute_kernel}) {
         kernel->named_compile_time_args = ksplit_named_args;
     }
+    for (auto* kernel : {&reader_kernel, &compute_kernel}) {
+        kernel->named_compile_time_args.emplace_back("k_expand", k_expand ? 1u : 0u);
+        kernel->named_compile_time_args.emplace_back("dht_qk", DHt_qk);
+        kernel->named_compile_time_args.emplace_back("cb_wuk", cb_wuk);
+        kernel->named_compile_time_args.emplace_back("cb_kexp", cb_kexp);
+    }
     reader_kernel.named_compile_time_args.emplace_back(
         "k_row_Wt", input_tensor_k.padded_shape()[3] / tt::constants::TILE_WIDTH);
     reader_kernel.named_compile_time_args.emplace_back(
@@ -3263,6 +3285,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
 
         if (ksplit_count > 1) {
             reader_args.push_back(ksplit_band(i));
+        }
+        // Expanded K: W_UK's address, the last reader arg (patched on cache hits like the other buffers).
+        if (k_expand) {
+            reader_args.push_back(tensor_args.k_expand_weight->buffer());
         }
         reader_kernel.emplace_runtime_args(core, reader_args.args);
 
