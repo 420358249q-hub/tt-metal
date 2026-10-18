@@ -2582,26 +2582,36 @@ def _per_head_pccs(a, b, valid):
     return [comp_pcc(x[0, h, r], y[0, h, r])[1] for x, y, r in zip(a, b, rows) if r.any() for h in range(x.shape[1])]
 
 
-def test_mla_per_head_pccs_real_rows():
-    """Host only: the real-row mask still catches an error on real rows of any (SP, TP) device, and ignores padding.
-    Shapes and mask follow the K3 pad-overflow final chunk: 8 x 4 mesh, 640 rows per chip, 32 real tokens on SP 7."""
-    sp, tp, heads, rows = 8, 4, 2, 640
-    positions = rotated_chip_positions(10176, sp, rows)
-    valid = torch.tensor([[p < 10208 for p in chip] for chip in positions])
-    assert valid.sum() == valid[sp - 1].sum() == 32
+@pytest.mark.parametrize(
+    "kv_actual,isl,real_sp",
+    [(10176, 32, [7]), (1280, 1920, [2, 3, 4])],
+    ids=["padoverflow-final", "rot_partial-iter1"],
+)
+def test_mla_per_head_pccs_real_rows(kv_actual, isl, real_sp):
+    """Host only: the real-row mask ignores padding (so a device mapped to the wrong SP row fails), compares every head
+    of every device with real rows, and still catches an error in any one of them. Masks follow the pad-overflow final
+    chunk (32 real tokens on SP 7) and the rot_partial rotated partial chunk (SP 2-4) on an 8 x 4 mesh, 640 rows per
+    chip."""
+    sp, tp, heads, rows = 8, 4, 3, 640
+    positions = rotated_chip_positions(kv_actual, sp, rows)
+    valid = torch.tensor([[p < kv_actual + isl for p in chip] for chip in positions])
+    assert valid.sum() == isl and valid.any(dim=1).nonzero().flatten().tolist() == real_sp
     torch.manual_seed(0)
     a = [torch.randn(1, heads, rows, 64) for _ in range(sp * tp)]
     padded = [x.clone() for x in a]
     for x, r in zip(padded, valid.repeat_interleave(tp, dim=0)):
         x[:, :, ~r] = torch.randn_like(x[:, :, ~r])
-    assert min(_per_head_pccs(a, padded, valid)) > 0.9999, "padding rows were compared"
+    pccs = _per_head_pccs(a, padded, valid)
+    assert len(pccs) == len(real_sp) * tp * heads, f"{len(pccs)} PCCs"
+    assert min(pccs) > 0.9999, "padding rows were compared"
     for d in range(sp * tp):
-        bad = [x.clone() for x in a]
         r = valid[d // tp]
         if not r.any():
             continue
-        bad[d][0, 1, r] = torch.randn_like(bad[d][0, 1, r])
-        assert min(_per_head_pccs(a, bad, valid)) < 0.5, f"error on device {d} real rows missed"
+        for h in range(heads):
+            bad = [x.clone() for x in a]
+            bad[d][0, h, r] = torch.randn_like(bad[d][0, h, r])
+            assert min(_per_head_pccs(a, bad, valid)) < 0.5, f"error on device {d} head {h} real rows missed"
 
 
 # Expanded K (docs/expanded_k/PLAN.md E1/E2): K expanded per head inside the SDPA is the same attention as the absorbed

@@ -7,6 +7,6 @@ excluded. Fixes are in the next commit.
 
 | # | Finding | Reviewer | Severity | Resolution |
 |---|---|---|---|---|
-| 1 | No test proves the mask still catches errors on real rows, per TP rank | Codex | minor | Added host-only `test_mla_per_head_pccs_real_rows` (pad-overflow mask; corrupt real rows on each device fails, corrupt padding passes) |
+| 1 | No test proves the mask still catches errors on real rows, per TP rank | Codex | minor | Added host-only `test_mla_per_head_pccs_real_rows` (pad-overflow mask; corrupting real rows on each TP rank of SP 7 fails, corrupting padding passes) |
 | 2 | `tp_size = len(a) // sp` does not check divisibility | Claude | minor | Assert added |
 | 3 | All devices skipped would raise a bare `ValueError` from `min()` | Claude | minor | Not changed: every iteration has at least one real token (asserted in the harness) |
