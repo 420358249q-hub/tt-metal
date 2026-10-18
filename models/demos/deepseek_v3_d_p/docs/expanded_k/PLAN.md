@@ -201,7 +201,7 @@ row's multicast to its pairs' exchanges.
 
 | Phase | Work | Exit |
 |---|---|---|
-| 1 | Q/K width split (§3.1); `k_expand_weight` with every core expanding its whole head (§3.2–3.3); L1 plan at k256/k512; in-situ expansion MAC/s from the profiler | E1 on both shapes (independent mode); throughput ≥ 60% of QK, else stop |
+| 1 | Q/K width split (§3.1); `k_expand_weight` with every core expanding its whole head (§3.2–3.3); L1 plan at k256/k512; in-situ expansion MAC/s from the profiler | E1 on both shapes (independent mode); throughput ≥ 60% of QK, else stop (waived, §0) |
 | 2 | Head-group exchange (§3.4) | E1 in group mode; per-core work drops as §1 |
 | 3 | MLA integration behind `PREFILL_MLA_EXPANDED_K` (default off); chunk retune; perf | E2, E3, E4 |
 | 4 | Default on for Kimi if E3 holds; docs | E5, E6 |

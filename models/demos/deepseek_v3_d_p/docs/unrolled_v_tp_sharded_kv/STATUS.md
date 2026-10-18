@@ -176,7 +176,7 @@ scripts/run_safe_pytest.sh --run-all $T::test_mla_chunked_prefill -k "torus-xy-8
 4. **Rebase onto main once PR #59531 merges,** dropping the merge commit.
 5. **Expanded K on arrival (PLAN.md §6): done through Phase 2**, behind `PREFILL_MLA_EXPANDED_K=1` (off by default).
    Steady-state MLA forward vs absorbed unrolled-V: −20.7% to −25.1% at the four points; K3 512k is 47% faster than
-   main's `ring_mla`. Status, remaining work (default-on, chunk retune, groups of 4, model-level runs) and evidence:
+   main's `ring_mla`. Status, remaining work (default-on, groups of 4, model-level runs) and evidence:
    [../expanded_k/STATUS.md](../expanded_k/STATUS.md).
 6. **Upstream bits worth splitting out as separate PRs:**
    - `high_bw_all_gather` `outer_block_rows` (useful on its own);
