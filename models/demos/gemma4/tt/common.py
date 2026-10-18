@@ -51,6 +51,43 @@ def gemma4_env_flag(name, default="0"):
     return os.environ.get(name, default).lower() in ("1", "true", "yes")
 
 
+def gemma4_cache_layout(mesh_device, mesh_config):
+    """Every build knob that decides WHICH tensorbin FILENAMES a build needs (the warm-cache identity).
+
+    A warm marker seeded before a filename change certifies a build whose files do not exist yet, and
+    as_tensor then persists dataless placeholders under the new names (weight_cache.py "Build options
+    that change an as_tensor cache FILENAME ... must match exactly"). #50648 renamed the fused gate/up,
+    .ws attention and .ws down-proj files without touching this identity and poisoned the Gemma-4-E4B
+    caches on bh_p300 / bh_quietbox_2 (#54831: 2085 of 2131 keys served as torch.empty and written to
+    disk). Bump the layout tag whenever a cache filename scheme changes.
+    """
+    from models.demos.gemma4.tt.experts.weights import _expert_parallel_factors
+
+    ep, tp, _ep_axis, tp_axis = _expert_parallel_factors(mesh_device, mesh_config)
+    return {
+        # v3: routed experts are stored whole per chip (*_ep{ep}tp{tp}_whole_* fused [up|gate]) instead
+        # of intermediate-sliced; the v2 marker certified only the old expert filenames.
+        "layout": "v3-experts-whole-ep-tp",
+        # Fractured builds write *_f8x4_* MLP files; a marker seeded by a plain
+        # TP build must not certify them.
+        "weight_layout": (
+            f"fractured-tp_axis{getattr(mesh_config, 'tp_axis', 1)}"
+            if bool(getattr(mesh_config, "weight_fracture", False))
+            else "tp"
+        ),
+        # The routed-expert files are named by their partition (*_ep{ep}tp{tp}_whole_*), and
+        # GEMMA4_MOE_EP changes the partition on the same mesh: a marker seeded under one
+        # partition must not certify the files of another.
+        "expert_partition": f"ep{ep}tp{tp}_tp_axis{tp_axis}",
+        "attn_dram_shard": os.environ.get("GEMMA4_ATTN_DRAM_SHARD", "1"),
+        "mlp_dram_shard": os.environ.get("GEMMA4_MLP_DRAM_SHARD", "1"),
+        "dram_cores": os.environ.get("GEMMA4_DRAM_CORES", "8"),
+        # The token-dispatch prefill converts the routed experts into the fused kernel's own cache files; a
+        # marker seeded without them must not certify a build that needs them.
+        "moe_dispatch_prefill": os.environ.get("GEMMA4_MOE_DISPATCH_PREFILL", "0"),
+    }
+
+
 # Generator prefill chunk used with CP prefill: 6144 rows per column fill the SDPA grid.
 GEMMA4_CP_PREFILL_CHUNK = 24576
 
@@ -71,6 +108,18 @@ def gemma4_cp_prefill_engaged(mesh_device):
         and is2d
         and not gemma4_env_flag("GEMMA4_GALAXY_LANES")
     )
+
+
+def _moe_expert_parallel(hf_text_config, mesh_shape, tp_axis) -> int:
+    """Expert-parallel degree for a MoE checkpoint on a 2-D mesh: the size of the non-TP axis
+    (each row of it computes its own slice of the expert set; see experts/__init__.py).
+    1 for dense checkpoints, 1-D meshes, or GEMMA4_MOE_EP=0."""
+    if not (getattr(hf_text_config, "num_experts", None) or 0):
+        return 1
+    if os.environ.get("GEMMA4_MOE_EP", "1").lower() in ("0", "false", "no"):
+        return 1
+    ep_axis = 0 if tp_axis == 1 else 1
+    return int(mesh_shape[ep_axis]) if int(mesh_shape[ep_axis]) > 1 else 1
 
 
 def create_tt_model(
@@ -118,9 +167,11 @@ def create_tt_model(
             # are both valid, so orientation stays a MESH_DEVICE knob. GEMMA4_GALAXY_LANES=1 lane-shards the batch.
             _shape = tuple(mesh_device.shape)
             _tp_axis = 0 if _shape[0] == 8 else (1 if _shape[1] == 8 else 0)
+            _ep = _moe_expert_parallel(hf_text_config, _shape, _tp_axis)
             mesh_config = MeshConfig(
                 mesh_device.shape,
-                decode=ModeConfig(tp=_shape[_tp_axis]),
+                decode=ModeConfig(tp=_shape[_tp_axis], ep=_ep),
+                prefill=ModeConfig(tp=_shape[_tp_axis], ep=_ep),
                 tp_axis=_tp_axis,
                 weight_fracture=True,
             )
@@ -132,7 +183,12 @@ def create_tt_model(
                 logger.warning("GEMMA4_CP_PREFILL ignored: incompatible with GEMMA4_GALAXY_LANES (owner-lane KV)")
                 mesh_config.cp_prefill = False
         elif is_mesh and num_devices > 1:
-            mesh_config = MeshConfig(mesh_device.shape, decode=ModeConfig(tp=mesh_device.shape[1]))
+            _ep = _moe_expert_parallel(hf_text_config, tuple(mesh_device.shape), 1)
+            mesh_config = MeshConfig(
+                mesh_device.shape,
+                decode=ModeConfig(tp=mesh_device.shape[1], ep=_ep),
+                prefill=ModeConfig(tp=mesh_device.shape[1], ep=_ep),
+            )
         else:
             mesh_config = MeshConfig((1, 1), decode=ModeConfig(tp=1))
 
@@ -168,24 +224,8 @@ def create_tt_model(
     # ceiling at long context.
     _precision_for_variant = Gemma4Precision.load(model_path, _worker_mesh, max_seq_len=max_seq_len)
     # The variant must also pin every knob that decides WHICH tensorbin FILENAMES a build needs, not
-    # only their dtype: a warm marker seeded before a filename change certifies a build whose files
-    # do not exist yet, and as_tensor then persists the dataless placeholders under the new names
-    # (weight_cache.py "Build options that change an as_tensor cache FILENAME ... must match
-    # exactly"). #50648 renamed the fused gate/up, .ws attention and .ws down-proj files without
-    # touching this identity and poisoned the Gemma-4-E4B caches on bh_p300 / bh_quietbox_2
-    # (#54831: 2085 of 2131 keys served as torch.empty and written to disk). Bump the layout tag
-    # whenever a cache filename scheme changes.
-    _cache_layout = {
-        "layout": "v2-fused-gate-up-ws",
-        # Fractured builds write *_f8x4_* MLP files; a marker seeded by a plain
-        # TP build must not certify them.
-        "weight_layout": (
-            f"fractured-tp_axis{mesh_config.tp_axis}" if bool(getattr(mesh_config, "weight_fracture", False)) else "tp"
-        ),
-        "attn_dram_shard": os.environ.get("GEMMA4_ATTN_DRAM_SHARD", "1"),
-        "mlp_dram_shard": os.environ.get("GEMMA4_MLP_DRAM_SHARD", "1"),
-        "dram_cores": os.environ.get("GEMMA4_DRAM_CORES", "8"),
-    }
+    # only their dtype (see gemma4_cache_layout).
+    _cache_layout = gemma4_cache_layout(mesh_device, mesh_config)
     cache_identity = dict(
         # vLLM hands over the resolved hub snapshot dir, not the HF id: keyed on the plain
         # basename the marker seeded by the e2e demo never matched and every server start
@@ -199,8 +239,11 @@ def create_tt_model(
         },
     )
     loaded_real_weights = False
+    # The decode MoE kernel uploads its bfp4 expert weights from the host tensors on every build (no cache yet),
+    # so a warm-cache placeholder cannot serve it: always load the checkpoint when it is on.
+    needs_host_weights = os.environ.get("GEMMA4_MOE_DECODE_KERNEL", "0") == "1"
     if state_dict is None:
-        if num_layers is None and weight_cache_is_complete(cache_dir, **cache_identity):
+        if num_layers is None and not needs_host_weights and weight_cache_is_complete(cache_dir, **cache_identity):
             logger.info("Warm ttnn weight cache detected -- skipping HF state_dict load (gemma4 hybrid).")
             state_dict = build_cached_state_dict(
                 cache_dir, args=model_args, build_variant=cache_identity["build_variant"]
