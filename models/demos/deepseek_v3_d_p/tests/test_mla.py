@@ -588,11 +588,11 @@ def _poison_tp_latent_slot(mesh_device, tt_ccl, *, seq_len, kvpe_dim, sp_axis, t
 
 
 def _weights_digest(key, weights):
-    """Fold the weights' names, shapes, dtypes and a strided sample of their values into a hashlib object."""
+    """Fold the weights' names, shapes, dtypes and every byte of their values into a hashlib object (~1 s for K3)."""
     for name in sorted(weights):
         t = weights[name]
         key.update(f"{name}{tuple(t.shape)}{t.dtype}".encode())
-        key.update(t.flatten()[:: max(1, t.numel() // 4096)].float().numpy().tobytes())
+        key.update(t.detach().contiguous().view(torch.uint8).numpy())
 
 
 def _test_weight_cache_dir(weights, mesh_device):
@@ -611,6 +611,27 @@ def _test_weight_cache_dir(weights, mesh_device):
     path = Path(root) / key.hexdigest()[:16]
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def test_mla_test_weight_cache_dir_keys(tmp_path, monkeypatch):
+    """Host-only: the opt-in weight cache is off without MLA_TEST_WEIGHT_CACHE, and its key changes with any weight
+    element (not just a sample) and with the mesh shape."""
+
+    class Mesh:
+        def __init__(self, shape):
+            self.shape = shape
+
+    # 256 x 256: a 4096-element strided sample would skip element [0, 1].
+    weights = {"a": torch.randn(256, 256, dtype=torch.bfloat16), "b": torch.randn(32, dtype=torch.bfloat16)}
+    monkeypatch.delenv("MLA_TEST_WEIGHT_CACHE", raising=False)
+    assert _test_weight_cache_dir(weights, Mesh((8, 4))) is None
+    monkeypatch.setenv("MLA_TEST_WEIGHT_CACHE", str(tmp_path))
+    base = _test_weight_cache_dir(weights, Mesh((8, 4)))
+    assert base.is_dir() and base == _test_weight_cache_dir(dict(weights), Mesh((8, 4)))
+    changed = dict(weights, a=weights["a"].clone())
+    changed["a"][0, 1] += 1
+    assert _test_weight_cache_dir(changed, Mesh((8, 4))) != base
+    assert _test_weight_cache_dir(weights, Mesh((4, 8))) != base
 
 
 def _run_chunked_prefill(
