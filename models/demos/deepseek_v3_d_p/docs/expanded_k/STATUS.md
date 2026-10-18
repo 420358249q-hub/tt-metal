@@ -28,12 +28,12 @@ The rest of the change:
 
 | | Criterion | Status | Evidence |
 |---|---|---|---|
-| E1 | Op correctness vs un-absorbed reference | ◐ | Checked through MLA (E2). A dedicated op-level test is not written yet |
-| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. Each passes the harness's CPU-reference check, and expanded vs absorbed is PCC ≥ 0.99979 (gate 0.999). `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
+| E1 | Op correctness vs un-absorbed reference | ◐ | Through MLA, on the table schedules and on forced ones (`test_mla_expanded_k_schedules`: q160/k256 with no K split, q64/k256 with 2–3 Q chunks per core; 16/16). Weight addresses on cache hits: `test_mla_expanded_k_distinct_layer_weights` (2/2, PCC ≥ 0.99972). A standalone op test against a torch un-absorbed reference is still to write |
+| E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. Each passes the harness's CPU-reference check, and expanded vs absorbed is PCC ≥ 0.99979 (gate 0.999). `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
 | E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k | ◐ | K2.7 256k −16.3%, K2.7 50k −14.1%, K3 50k −12.5%, K3 512k −14.6% (just under 15%: Phase 2) |
-| E4 | Multi-layer trace with distinct weights | ☐ | — |
+| E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. Prefetch off is not traced yet |
 | E5 | Absorbed path unchanged, selectable | ◐ | Off by default. Absorbed X2 subset (rotated scenarios, both variants and paths): 24/24 bitwise. The Phase 3 prefetch test passes on the same build; X4 was not re-run |
-| E6 | Two reviews per commit | ☐ | Pending for the Phase 1 commit |
+| E6 | Two reviews per commit | ◐ | Phase 1 (`c19695fd7b5`) reviewed by both, no blocker ([log](reviews/c19695fd7b5.md)); the fix commit is pending review |
 
 ## Accuracy (E2)
 
@@ -65,11 +65,28 @@ Traced replays of a steady-state layer (layer 1 of 3), the parent plan's X5 meth
 - **K3's schedule.** K3 at its absorbed schedule (q160, 4 cores per head, k256) was +11.5% slower (8.457 ms at 50k).
   The q320 / 2-band schedule is what made Phase 1 a gain for K3.
 
+## Expansion throughput (stop criterion)
+
+Realtime profiler, SDPA program, steady-state K2.7 256k layer (`sp_only`), all on the same q320 / k256 / 3-band
+schedule:
+
+| Variant | SDPA device time |
+|---|---|
+| Absorbed | 19.705 ms |
+| Expanded | 16.543 ms |
+| Expanded, 1 of every 16 expansion matmuls kept (a local kernel edit, not committed) | 12.744 ms |
+
+- **The expansion takes ≈ 4.05 ms** (16/15 × 3.80 ms), about 24% of the expanded SDPA.
+- **Throughput:** it is 16.8M MACs per core per K chunk. Going from 576 to 192 wide saves 31.5M QK MACs, worth
+  19.71 − 12.49 = 7.2 ms. So the expansion runs at ≈ 95% of QK's MAC throughput, well above the plan's 60% floor.
+- **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
+  exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
+
 ## Next steps
 
-1. Review the Phase 1 commit (E6).
-2. Op-level test (E1): torch reference, K-split bands, chunk 0, cache-hit address patching.
-3. E4: a 3-layer trace with distinct weights, prefetch on and off.
+1. Review the Phase 1 fix commit (E6).
+2. A standalone op-level test (E1) against a torch un-absorbed reference: K-split bands with an empty band, chunk 0.
+3. E4: trace the prefetch-off case too.
 4. Phase 2, the head-group exchange (PLAN.md §3.4): removes the remaining 2× redundant expansion, which is the path
    to ≥ 15% at K3 512k. Then a chunk retune.
-5. In-situ expansion throughput (MAC/s) from the realtime profiler, for the stop criterion.
+5. Model-level runs with weights (golden trace, transformer tests) with `PREFILL_MLA_EXPANDED_K=1`.

@@ -1391,6 +1391,10 @@ void kernel_main() {
                         // This Q chunk's head's W_UK, [128, 512] = 4 x 16 tiles, tile-row-major: same lifetime as Q
                         // (compute pops both together).
                         constexpr uint32_t wuk_tiles = 4 * 16;
+                        // The op validates [c_kv (512) | k_pe] latent K and [q_nope (128) | q_pe] Q with matching PE
+                        // widths, so Q has exactly 4 tile rows more than the latent's PE part (compute's count).
+                        static_assert(
+                            !k_expand || DHt_qk + 16 == DHt + 4, "expanded K: W_UK is 128 x 512 (4 x 16 tiles)");
                         constexpr uint32_t wuk_tile_bytes = get_tile_size(cb_wuk);
                         const InterleavedAddrGenFast<true> wuk_gen = {
                             .bank_base_address = wuk_addr,

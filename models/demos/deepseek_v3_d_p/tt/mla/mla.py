@@ -560,9 +560,8 @@ class ttMLA:
             # Expanded K (docs/expanded_k/PLAN.md), PREFILL_MLA_EXPANDED_K=1: Q un-absorbed at 192 wide, K expanded per
             # head inside the SDPA from the latent with wkv_b1 (W_UK), so QK runs at 192 instead of 576. Dense chunked
             # unrolled-V only; off by default.
-            self._expanded_k = (
-                self.is_chunked and not self._has_indexer and os.getenv("PREFILL_MLA_EXPANDED_K", "0") == "1"
-            )
+            if self.is_chunked and not self._has_indexer and os.getenv("PREFILL_MLA_EXPANDED_K", "0") == "1":
+                self._expanded_k = self._expanded_k_supported()
             if self.is_chunked and not self._has_indexer:
                 self._init_unrolled_v()
             self.o_proj_weight = weights["o_proj"]
@@ -1222,6 +1221,28 @@ class ttMLA:
     # within 5.2%). K3 at the Galaxy shape: 97 us, 71% FPU util.
     _UNROLLED_V_WIDE_LOCAL_HEADS = 24
 
+    def _expanded_k_supported(self) -> bool:
+        """Expanded K needs the kernel's MLA geometry (latent 512, per-head no-PE 128), no per-position query scale or
+        balanced attention, and a measured chunk schedule for this shape: the absorbed model's chunks are sized for a
+        576-wide K and can overflow L1 beside the expanded K^T CB. Anything else keeps absorbed K, with a warning."""
+        heads_local = self.num_heads // self.tp_factor
+        key = (self.kv_lora_rank + self.qk_rope_head_dim, heads_local, self.active_seq_len // self.sp_factor)
+        reasons = [
+            reason
+            for reason, bad in (
+                (f"kv_lora_rank {self.kv_lora_rank} != 512", self.kv_lora_rank != 512),
+                (f"qk_nope_head_dim {self.qk_nope_head_dim} != 128", self.qk_nope_head_dim != 128),
+                ("llama4 query scale", self._llama4_beta is not None),
+                ("balanced attention", self.is_balanced),
+                (f"no measured expanded-K chunk schedule for {key}", key not in self._EXPANDED_K_SDPA_CHUNKS),
+            )
+            if bad
+        ]
+        if reasons:
+            logger.warning(f"PREFILL_MLA_EXPANDED_K ignored on layer {self.layer_idx}: {'; '.join(reasons)}")
+            return False
+        return True
+
     def _init_unrolled_v(self):
         """W_UV as one [kv_lora_rank, H_local * v_head_dim] head-major weight, and the V expansion's static configs."""
         w_bf16 = ttnn.typecast(self.wkv_b2_weight, ttnn.bfloat16)  # [1, H_local, kv_lora_rank, v_head_dim]
@@ -1307,7 +1328,8 @@ class ttMLA:
         one core; when the units leave whole grid rows idle, ring_joint's K split gives every band of rows a slice of
         the K/V sequence."""
         key = (self.kv_lora_rank + self.qk_rope_head_dim, num_local_heads, seq_len_local)
-        if self._expanded_k and key in self._EXPANDED_K_SDPA_CHUNKS:
+        if self._expanded_k:
+            # Validated at construction (_expanded_k_supported).
             return self._EXPANDED_K_SDPA_CHUNKS[key]
         measured = self._UNROLLED_V_SDPA_CHUNKS.get(key)
         if measured is not None:

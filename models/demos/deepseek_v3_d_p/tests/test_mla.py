@@ -602,6 +602,7 @@ def _run_chunked_prefill(
     tight_cache=False,
     tp_shard_kv=False,
     return_outputs=False,
+    return_pccs=False,
     trace_time=False,
     poison_tp_latent_slot=False,
     num_cache_layers=1,
@@ -1069,6 +1070,16 @@ def _run_chunked_prefill(
     if trace_time:
         return traced_ns
     if return_outputs:
+        if return_pccs:
+            # Each user's full measured-region output PCC against the reference (the check below, as values).
+            pccs = [
+                comp_pcc(
+                    users[u]["ref_out"][prefill_len:].reshape(1, 1, -1, hidden_size).float(),
+                    out_accum[u][:, :, prefill_len:, :].float(),
+                )[1]
+                for u in range(num_users)
+            ]
+            return out_accum, pccs
         return out_accum
 
     if determinism_check:
@@ -1902,8 +1913,11 @@ _X4_STEPS = [(0, 0), (1, 0), (0, 5120), (0, 10240), (1, 2560), (0, 15360), (1, 7
     indirect=["mesh_device", "device_params"],
 )
 @pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
 @pytest.mark.timeout(0)
-def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_params, variant):
+def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_params, variant, expanded_k, monkeypatch):
+    # Expanded K (docs/expanded_k/PLAN.md E4): every layer passes its own wkv_b1 as the in-kernel K weight.
+    monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     config, weights = request.getfixturevalue("random_weights")
     sp_axis, tp_axis = 0, 1
     mesh_shape = tuple(mesh_device.shape)
@@ -1915,10 +1929,14 @@ def test_mla_tp_sharded_trace_replay_multi_layer(request, mesh_device, device_pa
     kvpe_dim = config.kv_lora_rank + config.qk_rope_head_dim
     topology = per_axis_topology(device_params["fabric_config"])
 
+    def layer_weights(layer):
+        # Distinct per-layer kv_b (W_UK, W_UV): a captured program that kept another layer's weight address would differ.
+        return {**weights, "kv_b_proj.weight": (weights["kv_b_proj.weight"].float() * (1 + 0.25 * layer)).bfloat16()}
+
     layers = [
         ttMLA(
             config,
-            weights,
+            layer_weights(layer),
             mesh_device,
             layer_idx=layer,
             seq_len=seq_len_cache,
@@ -2465,13 +2483,21 @@ _EXPANDED_K_MIN_PCC_VS_ABSORBED = 0.999
 def test_mla_expanded_k_matches_absorbed(
     request, mesh_device, device_params, kwargs, variant, use_metadata_tensor, tp_shard_kv, monkeypatch
 ):
-    """Expanded K vs absorbed K on CPU-reference inputs: each passes the harness's reference PCC, and their outputs
-    agree to _EXPANDED_K_MIN_PCC_VS_ABSORBED per user."""
+    """Expanded K vs absorbed K on CPU-reference inputs (E2): per user, the expanded output's PCC against the reference
+    is at least the absorbed one's minus 0.001, and the two outputs agree to _EXPANDED_K_MIN_PCC_VS_ABSORBED."""
+    _check_expanded_k_vs_absorbed(
+        request, mesh_device, device_params, kwargs, use_metadata_tensor, tp_shard_kv, monkeypatch
+    )
+
+
+def _check_expanded_k_vs_absorbed(
+    request, mesh_device, device_params, kwargs, use_metadata_tensor, tp_shard_kv, monkeypatch
+):
     topology = per_axis_topology(device_params["fabric_config"])
-    outs = {}
+    outs, ref_pccs = {}, {}
     for expanded in (False, True):
         monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded else "0")
-        outs[expanded] = _run_chunked_prefill(
+        outs[expanded], ref_pccs[expanded] = _run_chunked_prefill(
             request,
             mesh_device,
             reference="cpu",
@@ -2479,10 +2505,173 @@ def test_mla_expanded_k_matches_absorbed(
             use_metadata_tensor=use_metadata_tensor,
             tp_shard_kv=tp_shard_kv,
             return_outputs=True,
+            return_pccs=True,
             **kwargs,
         )
     for u, (absorbed, expanded) in enumerate(zip(outs[False], outs[True])):
         assert torch.isfinite(expanded).all(), f"user {u}: non-finite expanded-K output"
         _, pcc = comp_pcc(absorbed.float(), expanded.float(), _EXPANDED_K_MIN_PCC_VS_ABSORBED)
-        logger.info(f"user {u}: expanded K vs absorbed PCC {pcc}")
+        ref_absorbed, ref_expanded = ref_pccs[False][u], ref_pccs[True][u]
+        logger.info(
+            f"user {u}: PCC vs CPU reference absorbed {ref_absorbed:.6f} expanded {ref_expanded:.6f}; expanded vs "
+            f"absorbed {pcc:.6f}"
+        )
+        assert (
+            ref_expanded >= ref_absorbed - 0.001
+        ), f"user {u}: expanded K PCC {ref_expanded} < absorbed {ref_absorbed} - 0.001"
         assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"user {u}: expanded K vs absorbed PCC {pcc}"
+
+
+# Schedules outside the measured table (forced here): no K split with one Q chunk per core (q160/k256), and several Q
+# chunks per core (q64/k256: 160 units on 110 cores at K2.7, 240 at K3), where W_UK is pushed and popped per Q chunk
+# through a double-buffered cb_wuk.
+_EXPANDED_K_FORCED_SCHEDULES = {"q160_k256": (160, 256, 1), "q64_k256": (64, 256, 1)}
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "kwargs",
+    [pytest.param(kw, id=sid) for sid, kw in _CHUNKED_SCENARIOS if sid in ("rot-multislab", "rot-rot_partial")],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.parametrize("schedule", list(_EXPANDED_K_FORCED_SCHEDULES))
+@pytest.mark.timeout(0)
+def test_mla_expanded_k_schedules(
+    request, mesh_device, device_params, kwargs, variant, use_metadata_tensor, schedule, monkeypatch
+):
+    """test_mla_expanded_k_matches_absorbed's checks on schedules the table does not pick (sp_only)."""
+    chunks = _EXPANDED_K_FORCED_SCHEDULES[schedule]
+    monkeypatch.setattr(ttMLA, "_EXPANDED_K_SDPA_CHUNKS", {key: chunks for key in ttMLA._EXPANDED_K_SDPA_CHUNKS})
+    _check_expanded_k_vs_absorbed(request, mesh_device, device_params, kwargs, use_metadata_tensor, False, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.timeout(0)
+def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_params, variant, monkeypatch):
+    """Expanded K's W_UK is a runtime-patched buffer: three layers share one SDPA program (cache hits) with different
+    weights. Each layer's kv_b is rotated by one head against the previous layer's, so a program still reading an
+    earlier layer's W_UK would attend with another head's weights. Expanded vs absorbed (whose wkv_b1 matmul is a
+    separate op) must agree per layer and step, on the TP-sharded cache with the prefetch on, metadata path."""
+    monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1")
+    config, weights = request.getfixturevalue("random_weights")
+    sp_axis, tp_axis = 0, 1
+    mesh_shape = tuple(mesh_device.shape)
+    chunk = 5120
+    seq_len_cache = 4 * chunk
+    config.max_seq_len = seq_len_cache
+    num_layers, num_users = 3, 2
+    topology = per_axis_topology(device_params["fabric_config"])
+    request.addfinalizer(get_tt_ccl(mesh_device).release_tp_latent_prefetch_manager)
+    kv_b = weights["kv_b_proj.weight"]
+    heads = config.num_attention_heads
+
+    def layer_weights(layer):
+        per_head = kv_b.reshape(heads, -1, kv_b.shape[-1])
+        return {**weights, "kv_b_proj.weight": per_head.roll(layer, dims=0).reshape(kv_b.shape)}
+
+    layers = [
+        ttMLA(
+            config,
+            layer_weights(layer),
+            mesh_device,
+            layer_idx=layer,
+            seq_len=seq_len_cache,
+            sp_axis=sp_axis,
+            tp_axis=tp_axis,
+            is_balanced=False,
+            topology=topology,
+            is_chunked=True,
+            active_seq_len=chunk,
+            slot_num=num_users,
+            layer_num=num_layers,
+            tp_shard_kv=True,
+        )
+        for layer in range(num_layers)
+    ]
+    assert all(mla_layer._expanded_k for mla_layer in layers), "expanded K was not enabled for this shape"
+    rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
+    rope = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=seq_len_cache, chunk_size_global=chunk)
+    scale_buf = rope_setup.make_llama4_scale_buffer(chunk)
+    hidden_dims = [None, None]
+    hidden_dims[tp_axis] = -1
+    hidden_dims[sp_axis] = -2
+    mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=mesh_shape, dims=hidden_dims)
+    composer = ttnn.ConcatMesh2dToTensor(mesh_device, dims=hidden_dims, mesh_shape=mesh_device.shape)
+
+    def meta_scalar(value):
+        return ttnn.from_torch(
+            torch.tensor([value], dtype=torch.int64).reshape(1, 1, 1, 1),
+            device=mesh_device,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+        )
+
+    metadata = ChunkMetadata(meta_scalar(0), meta_scalar(0), meta_scalar(chunk), scale_buf)
+    outputs = {}
+    for expanded in (False, True):
+        for mla_layer in layers:
+            mla_layer._expanded_k = expanded
+        cache = init_mla_kv_cache(
+            cache_format=MlaKvCacheFormat.BFP8_TILE,
+            hf_config=config,
+            mesh_device=mesh_device,
+            seq_len=seq_len_cache,
+            mesh_shape=mesh_shape,
+            sp_axis=sp_axis,
+            num_kvpe_cache_layers=num_layers,
+            num_users=num_users,
+            tp_axis=tp_axis,
+        )
+        outputs[expanded] = []
+        for step, (user, start, valid) in enumerate(_PREFETCH_STEPS[:4]):
+            write_chunk_metadata(
+                metadata,
+                (user, start, start + valid),
+                hf_config=config,
+                mesh_device=mesh_device,
+                chunk_size_global=chunk,
+                sp_axis=sp_axis,
+            )
+            step_outs = []
+            with layers[0].tt_ccl.tp_latent_prefetch_chain():
+                for layer in range(num_layers):
+                    gen = torch.Generator().manual_seed(1000 * step + layer)
+                    hidden = ttnn.from_torch(
+                        torch.randn(1, 1, chunk, config.hidden_size, generator=gen, dtype=torch.bfloat16),
+                        device=mesh_device,
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=mapper,
+                    )
+                    out = layers[layer].forward(
+                        hidden_states=hidden,
+                        rope_tensors=rope,
+                        kvpe_cache=cache,
+                        actual_start=None,
+                        actual_end=None,
+                        cache_layer_idx=layer,
+                        cache_user_id=user,
+                        metadata=metadata,
+                    )
+                    step_outs.append(ttnn.to_torch(out, mesh_composer=composer).float())
+                    ttnn.deallocate(out)
+            outputs[expanded].append(step_outs)
+        ttnn.deallocate(cache.storage)
+    for step in range(len(outputs[True])):
+        for layer in range(num_layers):
+            _, pcc = comp_pcc(outputs[False][step][layer], outputs[True][step][layer], _EXPANDED_K_MIN_PCC_VS_ABSORBED)
+            logger.info(f"step {step} layer {layer}: expanded K vs absorbed PCC {pcc:.6f}")
+            assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"step {step} layer {layer}: expanded vs absorbed PCC {pcc}"
