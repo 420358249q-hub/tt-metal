@@ -2611,10 +2611,13 @@ def test_mla_expanded_k_schedules(
 @pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
 @pytest.mark.timeout(0)
 def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_params, variant, monkeypatch):
-    """Expanded K's W_UK is a runtime-patched buffer: three layers share one SDPA program (cache hits) with different
-    weights. Each layer's kv_b is rotated by one head against the previous layer's, so a program still reading an
-    earlier layer's W_UK would attend with another head's weights. Expanded vs absorbed (whose wkv_b1 matmul is a
-    separate op) must agree per layer and step, on the TP-sharded cache with the prefetch on, metadata path."""
+    """Expanded K's W_UK is a runtime-patched buffer. Each layer's kv_b is rotated by one head against the previous
+    layer's, so a program still reading another layer's W_UK would attend with a neighbouring head's weights:
+    expanded vs absorbed (whose wkv_b1 matmul is a separate op) must agree per layer and step, on the TP-sharded cache
+    with the prefetch on, metadata path. Separately, on sp_only and one cache layer, layers that differ only in their
+    weights must share every program (no new program-cache entry), which shows the address is patched rather than
+    keyed. That sharing is not asserted on the tp_sharded path above, where the SDPA program is also keyed by cache
+    layer on the metadata path."""
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1")
     config, weights = request.getfixturevalue("random_weights")
     sp_axis, tp_axis = 0, 1
@@ -2747,11 +2750,20 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
         mla_layer._expanded_k = True
     cache = new_cache(tp_sharded=False)
     set_step(0)
+    before = mesh_device.num_program_cache_entries()
     forward_layer(cache, 0, 0)
     entries = mesh_device.num_program_cache_entries()
-    for layer in (1, 2):
-        forward_layer(cache, 0, layer, cache_layer_idx=0)
+    assert entries > before, "the program cache did not record layer 0's sp_only programs"
+    shared = {layer: forward_layer(cache, 0, layer, cache_layer_idx=0) for layer in (1, 2)}
     assert mesh_device.num_program_cache_entries() == entries, "a layer with different weights compiled new programs"
+    # ... and the shared program used each layer's own W_UK (step 0 writes only its own chunk, so each run's inputs match).
+    for layer in (1, 2):
+        layers[layer]._expanded_k = False
+        absorbed = forward_layer(cache, 0, layer, cache_layer_idx=0)
+        _, pcc = comp_pcc(absorbed, shared[layer], _EXPANDED_K_MIN_PCC_VS_ABSORBED)
+        assert (
+            pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED
+        ), f"layer {layer} on a shared program: expanded vs absorbed PCC {pcc}"
     ttnn.deallocate(cache.storage)
 
 
@@ -2762,14 +2774,19 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
 )
 @pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
 @pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
+@pytest.mark.parametrize("tp_shard_kv", [False, True], ids=["sp_only", "tp_sharded"])
+@pytest.mark.parametrize("use_metadata_tensor", [False, True], ids=["scalar", "metadata"])
+@pytest.mark.parametrize("valid", [5120, 2560], ids=["full", "partial"])
 @pytest.mark.timeout(0)
 def test_ring_joint_expanded_k_per_head_vs_reference(
-    request, mesh_device, device_params, variant, expanded_k, monkeypatch
+    request, mesh_device, device_params, variant, expanded_k, tp_shard_kv, use_metadata_tensor, valid, monkeypatch
 ):
-    """E1: the ring_joint SDPA output per head against fp32 attention on the device's own inputs, for one 5k chunk at
-    position 0 (natural token order: chip s holds tokens s*640..s*640+639). Expanded: K_h = [c_kv @ W_UK_h^T | k_pe] and
-    Q un-absorbed; absorbed: the latent K and Q. Causal; K2.7's three K-split bands leave some bands empty on chunk 0.
-    """
+    """E1: the ring_joint SDPA output per head against fp32 attention on the device's own inputs, for one chunk at
+    position 0 (natural token order: chip s holds tokens s*640..s*640+639), full or partial (keys past the valid tokens
+    masked, pad query rows not compared). Expanded: K_h = [c_kv @ W_UK_h^T | k_pe] and Q un-absorbed; absorbed: the latent
+    K and Q. Causal. K is the cache slot (sp_only) or the TP latent buffer (tp_sharded). K2.7's three K-split bands
+    leave some bands empty on chunk 0. PCC is checked per (query chip, head): output norms fall with the row index, so
+    one PCC over all rows would be dominated by chip 0, whose queries read only local K."""
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
     recorder = _SdpaRecorder(monkeypatch, keep_inputs=True)
     _run_chunked_prefill(
@@ -2777,8 +2794,10 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
         mesh_device,
         reference=None,
         topology=per_axis_topology(device_params["fabric_config"]),
-        iters_isl=[5120],
+        iters_isl=[valid],
         prefill_len=0,
+        use_metadata_tensor=use_metadata_tensor,
+        tp_shard_kv=tp_shard_kv,
     )
     (call,) = recorder.calls
     assert call["expanded"] == expanded_k
@@ -2789,10 +2808,11 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
     def gathered(per_device, t, take):
         return torch.cat([take(per_device[s * tp + t]) for s in range(sp)], dim=-2)
 
-    k_latent = gathered(call["k"], 0, lambda x: x[0, 0, :rows])  # [5120, 576], replicated over TP
-    causal = torch.ones(5120, 5120, dtype=torch.bool).tril()
-    worst = 1.0
+    keep = torch.ones(5120, 5120, dtype=torch.bool).tril()
+    keep[:, valid:] = False
+    worst, worst_err = 1.0, 0.0
     for t in range(tp):
+        k_latent = gathered(call["k"], t, lambda x: x[0, 0, :rows])  # [5120, 576], this TP device's copy
         q = gathered(call["q"], t, lambda x: x[0, :, :rows])  # [heads, 5120, D]
         v = gathered(call["v"], t, lambda x: x[0, :, :rows])  # [heads, 5120, 128]
         out = gathered(call["out"], t, lambda x: x[0, :, :rows])
@@ -2802,10 +2822,18 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
                 k = torch.cat([k_latent[:, :latent] @ w_uk.T, k_latent[:, latent:]], dim=-1)
             else:
                 k = k_latent
-            scores = (q[h] @ k.T) * call["scale"]
-            scores = scores.masked_fill(~causal, float("-inf"))
+            scores = ((q[h] @ k.T) * call["scale"]).masked_fill(~keep, float("-inf"))
             ref = torch.softmax(scores, dim=-1) @ v[h]
-            _, pcc = comp_pcc(ref, out[h])
-            worst = min(worst, pcc)
-            assert pcc >= 0.999, f"TP group {t} head {h}: SDPA PCC {pcc} vs fp32 reference"
-    logger.success(f"✓ SDPA per head vs fp32 reference ({'expanded' if expanded_k else 'absorbed'} K): min PCC {worst}")
+            assert torch.isfinite(out[h, :valid]).all(), f"TP group {t} head {h}: non-finite SDPA output"
+            for s in range(sp):
+                lo, hi = s * rows, min((s + 1) * rows, valid)
+                if lo >= hi:
+                    continue
+                _, pcc = comp_pcc(ref[lo:hi], out[h, lo:hi])
+                worst = min(worst, pcc)
+                worst_err = max(worst_err, (ref[lo:hi] - out[h, lo:hi]).abs().max().item())
+                assert pcc >= 0.999, f"TP group {t} head {h} query chip {s}: SDPA PCC {pcc} vs fp32 reference"
+    logger.success(
+        f"✓ SDPA per (query chip, head) vs fp32 reference ({'expanded' if expanded_k else 'absorbed'} K): min PCC "
+        f"{worst:.6f}, max abs error {worst_err:.4f}"
+    )
