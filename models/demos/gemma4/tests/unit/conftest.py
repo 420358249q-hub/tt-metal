@@ -79,6 +79,29 @@ def _stub_runtime(patch):
         bfloat16=object(),
     )
     patch.setitem(sys.modules, "ttnn", runtime)
+    # generator_vllm imports vLLM's Gemma 4 processor classes and the multimodal
+    # registry at module scope. Stub them only where vLLM is absent (the tt-metal
+    # unit-test runners), so the host tests import the real ones everywhere else.
+    try:
+        importlib.import_module("vllm.multimodal")
+    except ImportError:
+        registry = SimpleNamespace(register_processor=lambda *args, **kwargs: (lambda cls: cls))
+        vllm_stubs = {
+            "vllm": {"__path__": []},
+            "vllm.model_executor": {"__path__": []},
+            "vllm.model_executor.models": {"__path__": []},
+            "vllm.model_executor.models.gemma4_mm": {
+                name: type(name, (), {})
+                for name in ("Gemma4DummyInputsBuilder", "Gemma4MultiModalProcessor", "Gemma4ProcessingInfo")
+            },
+            "vllm.model_executor.models.gemma4_unified": {
+                "Gemma4UnifiedProcessingInfo": type("Gemma4UnifiedProcessingInfo", (), {})
+            },
+            "vllm.model_executor.models.interfaces": {"SupportsMultiModal": type("SupportsMultiModal", (), {})},
+            "vllm.multimodal": {"MULTIMODAL_REGISTRY": registry},
+        }
+        for name, members in vllm_stubs.items():
+            patch.setitem(sys.modules, name, _module(name, **members))
     lower_modules = {
         "ttnn.tools": {"trace_allocation_tracker": SimpleNamespace()},
         "models.common.sampling.tt_log_probs": {
@@ -114,7 +137,23 @@ def _stub_runtime(patch):
             "mask_page_table_columns_past_allocation": lambda tables, prompt_lens, block_sizes: (tables, 0),
             "max_batched_prefill_users": _unused,
             "resolve_batched_prefill_chunk_users": _unused,
+            # The multimodal entry points (vision / audio weights) are never reached by the contract tests.
+            "_build_vision_state_dict": _unused,
+            "_vision_encoder_seq_len": _unused,
+            "vision_state_dict_for": _unused,
         },
+        # The on-device multimodal embedders generator_vllm imports at module scope.
+        "models.demos.gemma4.tt.audio.unified_audio_embedder": {
+            "Gemma4UnifiedAudioEmbedder": _unused,
+            "has_unified_audio_weights": _unused,
+        },
+        "models.demos.gemma4.tt.vision.multimodal_embedder": {"Gemma4MultimodalEmbedder": _unused},
+        "models.demos.gemma4.tt.vision.unified_embedder": {
+            "Gemma4UnifiedVisionEmbedder": _unused,
+            "has_unified_vision_weights": _unused,
+        },
+        "models.demos.gemma4.tt.vision.vision_model_config": {"VisionModelArgs": _unused},
+        "models.demos.gemma4.tt.vision.vision_tower": {"VisionTower": _unused},
         "models.demos.gemma4.tt.generator_trace": {
             name: _unused
             for name in (
@@ -155,7 +194,8 @@ def _stub_runtime(patch):
             "bounded_ring_modulo": lambda window: window,
         },
         "models.demos.gemma4.tt.ccl": {"ccl_allgather": _unused, "ccl_allreduce": _unused},
-        "models.demos.gemma4.utils.general_utils": {"get_cache_file_name": _unused},
+        "models.tt_transformers.tt.ccl": {"TT_CCL": _unused},
+        "models.demos.gemma4.utils.general_utils": {"cast_host_for_ttnn": _unused, "get_cache_file_name": _unused},
     }
     for name, members in lower_modules.items():
         patch.setitem(sys.modules, name, _module(name, **members))
