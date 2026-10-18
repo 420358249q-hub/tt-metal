@@ -495,7 +495,8 @@ route use it).
    kernel conflicts are resolved once.
 2. Delete `ring_mla_packing_plan.hpp` (424 lines) and `ring_mla_geometry.hpp` (40), and their includes.
 3. Delete the packed-source paths (`GROUPED_KV_SOURCE_COUNT > 1`): `ring_joint_reader.cpp`, `ring_joint_writer.cpp`,
-   `ring_joint_sdpa.cpp`, and `compute_streaming.hpp` (11 `packed_kv_enabled` and 18 `GROUPED_KV_SOURCE_COUNT` lines). Delete the `kv_stripe_split > 1`
+   `ring_joint_sdpa.cpp`, and `compute_streaming.hpp`. Across the SDPA kernels: `packed_kv_enabled` on 17 lines (11 in
+   `compute_streaming.hpp`), `packed_sources` on 47 (17 there), `GROUPED_KV_SOURCE_COUNT` on 10. Delete the `kv_stripe_split > 1`
    validation in the device op and the program factory, the named compile-time argument, and the split-KV golden
    reorder (`_ring_mla_split_kv_global_order`) and nanobind docstring text. Roughly 500–700 lines.
 4. Fold `kv_stripe_split` to 1 where it is threaded through shared code instead of deleting those call sites:
@@ -504,8 +505,9 @@ route use it).
 5. Tests and CI:
    - Delete `tests/nightly/blackhole/sdpa/test_ring_mla_fused_gather.py`, the split-KV cases in
      `test_sdpa_golden_functions.py`, and `test_ring_mla_packing_plan.cpp` (with its `sources.cmake` line).
-   - Remove only the split-KV pytest command from the QB2 sanity job (`blackhole_multi_card_sanity_tests.yaml`). That job
-     also runs the remaining SDPA, `high_bw_all_gather` and indexer tests, including full-mesh cases, which stay.
+   - In the QB2 sanity job (`blackhole_multi_card_sanity_tests.yaml`), remove only the split-KV pytest command, the
+     comment above it, and the now-dead `--ignore=...test_ring_mla_fused_gather.py` on the `sdpa/` line. The job also runs
+     the remaining SDPA, `high_bw_all_gather` and indexer tests, including full-mesh cases, which stay.
    - Remove the split-KV perf gate (`blaze_models_prefill_tests.yaml`), and restore the timeout and time budget the PR
      added.
    - Keep the full-mesh `ring_joint` tests from #54941.
