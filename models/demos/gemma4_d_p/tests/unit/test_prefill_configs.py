@@ -20,15 +20,16 @@ GRID = SimpleNamespace(x=11, y=10)
 @pytest.mark.parametrize(
     "slab, sliding, expected",
     [
-        (256, False, (64, 256, 3, True)),
-        (512, False, (128, 256, 3, True)),
+        (256, False, (64, 256, 3, False)),
+        (512, False, (128, 256, 3, False)),
         (1024, False, (96, 256, 1, True)),
         (256, True, (128, 128, 3, False)),
         (512, True, (128, 128, 3, False)),
         (1024, True, (128, 128, 1, False)),
         # A quarter slab that is not whole tiles falls back to one tile.
-        (64, False, (32, 256, 3, True)),
-        (160, False, (32, 256, 3, True)),
+        (64, False, (32, 256, 3, False)),
+        # 40 units take 4 rows of 11, so three bands need 12 > 10 rows: unsplit, segmented.
+        (160, False, (32, 256, 1, True)),
         # Segmented accumulation needs one Q chunk per core: 8 heads x ceil(slab / q) <= 110 cores.
         (1536, False, (128, 256, 1, True)),
         (1664, False, (128, 256, 1, True)),
@@ -38,21 +39,23 @@ GRID = SimpleNamespace(x=11, y=10)
     ],
 )
 def test_ring_sdpa_chunk_sizes(slab, sliding, expected):
-    assert ring_sdpa_chunk_sizes(slab, sliding, num_heads=8, num_cores=110) == expected
+    assert ring_sdpa_chunk_sizes(slab, sliding, num_heads=8, grid=(11, 10)) == expected
 
 
 @pytest.mark.parametrize(
-    "slab, num_heads, num_cores, k_splits",
+    "slab, num_heads, grid, k_splits",
     [
-        # Three bands of every (head, q 128 chunk) unit must fit on the cores.
-        (512, 8, 96, 3),
-        (512, 8, 95, 1),
-        (256, 16, 96, 3),
-        (512, 16, 110, 1),
+        # Three bands of every (head, q 128 chunk) unit must fit in whole rows of the grid.
+        (512, 8, (11, 10), 3),
+        (512, 8, (11, 8), 1),
+        (256, 16, (11, 10), 3),
+        (512, 16, (11, 10), 1),
+        # 3 x 32 units fit 104 cores, but each band needs 3 of 8 rows.
+        (512, 8, (13, 8), 1),
     ],
 )
-def test_ring_sdpa_sliding_k_splits(slab, num_heads, num_cores, k_splits):
-    assert ring_sdpa_chunk_sizes(slab, True, num_heads=num_heads, num_cores=num_cores)[2] == k_splits
+def test_ring_sdpa_sliding_k_splits(slab, num_heads, grid, k_splits):
+    assert ring_sdpa_chunk_sizes(slab, True, num_heads=num_heads, grid=grid)[2] == k_splits
 
 
 @pytest.mark.parametrize(

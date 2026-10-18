@@ -189,7 +189,7 @@ def global_ring_prefill_attention(
     if program_config is None:
         sdpa_grid = ccl_manager.compute_grid_size
         q_chunk, k_chunk, k_splits, segmented = ring_sdpa_chunk_sizes(
-            tt_q.shape[-2], sliding=False, num_heads=tt_q.shape[1], num_cores=(sdpa_grid.x - 1) * sdpa_grid.y
+            tt_q.shape[-2], sliding=False, num_heads=tt_q.shape[1], grid=(sdpa_grid.x - 1, sdpa_grid.y)
         )
         program_config = ring_prefill_program_config(
             mesh_device,
@@ -245,27 +245,36 @@ _GLOBAL_Q_CHUNKS = (96, 128)
 
 # What each chunk size gets at CP8 / TP4:
 #                  q_chunk  k_chunk  K-split bands  segmented accumulation
-#   global  2048        64      256              3  yes
-#   global  4096       128      256              3  yes
+#   global  2048        64      256              3  no (K split)
+#   global  4096       128      256              3  no
 #   global  8192        96      256              1  yes
 #   global 16384        96      256              1  no (too many Q chunks for the cores)
 #   global 32768        96      256              1  no
 #   sliding 2048       128      128              3  no
 #   sliding 4096       128      128              3  no
 #   sliding 8192+      128      128              1  no
-def ring_sdpa_chunk_sizes(q_slab_tokens, sliding, num_heads=8, num_cores=110):
+def _k_splits(units, grid):
+    """3 if three bands of whole rows of the (head, Q chunk) units fit grid (cols, rows), else 1, as the op counts
+    them. The op also caps sliding layers by their window; Gemma4's 1024 allows 4."""
+    return 3 if 3 * -(-units // grid[0]) <= grid[1] else 1
+
+
+def ring_sdpa_chunk_sizes(q_slab_tokens, sliding, num_heads=8, grid=(11, 10)):
     """(q_chunk_size, k_chunk_size, max_k_splits, segmented_accumulation) for the ring SDPA, from the per-rank Q slab
-    (chunk / CP), the local heads and the SDPA cores.
+    (chunk / CP), the local heads and the SDPA grid (columns, rows).
     """
+    num_cores = grid[0] * grid[1]
     if sliding:
-        # Split K three ways when the cores hold three bands of every (head, Q chunk) unit.
         q_chunk = 128
-        k_splits = 3 if num_heads * -(-q_slab_tokens // q_chunk) * 3 <= num_cores else 1
-        return q_chunk, 128, k_splits, False
-    # Short slabs: 4 Q chunks per head are too few to fill the grid, so K is split over 3 bands.
+        return q_chunk, 128, _k_splits(num_heads * -(-q_slab_tokens // q_chunk), grid), False
+    # Short slabs: 4 Q chunks per head are too few to fill the grid, so K is split over 3 bands. The op refuses
+    # segmented accumulation with a K split, so it is on only where the split does not fit.
     if q_slab_tokens <= 512:
         q_chunk = q_slab_tokens // 4
-        return (q_chunk if q_chunk % TILE_HEIGHT == 0 else TILE_HEIGHT), 256, 3, True
+        q_chunk = q_chunk if q_chunk % TILE_HEIGHT == 0 else TILE_HEIGHT
+        units = num_heads * -(-q_slab_tokens // q_chunk)
+        k_splits = _k_splits(units, grid)
+        return q_chunk, 256, k_splits, k_splits == 1 and units <= num_cores
     # Segmented accumulation needs one Q chunk per core.
     for q_chunk in _GLOBAL_Q_CHUNKS:
         if -(-q_slab_tokens // q_chunk) * num_heads <= num_cores:
@@ -386,7 +395,7 @@ def sliding_ring_prefill_attention(
     if program_config is None:
         sdpa_grid = ccl_manager.compute_grid_size
         q_chunk, k_chunk, k_splits, _ = ring_sdpa_chunk_sizes(
-            tt_q.shape[-2], sliding=True, num_heads=tt_q.shape[1], num_cores=(sdpa_grid.x - 1) * sdpa_grid.y
+            tt_q.shape[-2], sliding=True, num_heads=tt_q.shape[1], grid=(sdpa_grid.x - 1, sdpa_grid.y)
         )
         program_config = ring_prefill_program_config(
             mesh_device, ccl_manager, head_dim, q_chunk_size=q_chunk, k_chunk_size=k_chunk, max_k_splits=k_splits
