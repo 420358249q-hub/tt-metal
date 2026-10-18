@@ -2179,7 +2179,7 @@ def test_mla_tp_sharded_trace_replay_multi_layer(
             tail = nat_eager[slot, user1_end:].abs().sum()
             assert (tail == 0) == (user == 1), f"user {user} layer {layer}: rows past {user1_end} in the wrong slot"
     logger.success(
-        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(steps)} "
+        f"✓ traced replay == eager (tp_sharded) == eager (sp_only), outputs and caches bitwise, over {len(x4_steps)} "
         f"steps x {num_layers} layers, replayed again after the sp_only pass"
     )
 
