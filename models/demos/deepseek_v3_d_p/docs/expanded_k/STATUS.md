@@ -107,7 +107,9 @@ schedule:
   - **Lower end:** a peak-based estimate (HiFi2, about 2 k MACs per cycle per core, 200–340 K chunks per core) puts
     the expansion at roughly 30–50% of FPU peak, against QK's ≈ 70% math utilisation. That ratio is roughly
     0.43–0.71.
-  - **So the 60% floor is not established** (waived, below). A blocked (multi-tile) expansion matmul
+  - **Superseded by the Phase 2 measurement below** (0.74–0.81 of QK's rate). The peak-based estimate was too
+    low: it assumed about 2 k MACs per cycle at HiFi2, which is the LoFi rate.
+  - **So the 60% floor was not established in Phase 1** (waived, below). A blocked (multi-tile) expansion matmul
     is the lever if throughput still limits E3 after Phase 2.
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
@@ -117,9 +119,42 @@ schedule:
 - E3 is met there at all four points (−20.7% to −25.1%), so the question the 60% floor stood for (whether the
   expansion pays enough to clear E3) is answered directly.
 
+## Expansion utilisation (Phase 2, measured)
+
+Measured at the author's request, as input for optimisation, not as a gate.
+
+**Method:**
+- A probe patch, not committed (`expk_util_probe.patch` in the work dir), wraps the expansion's matmul + pack loop
+  and the QK `blocked_matmul_and_pack` call in device-profiler sum zones (`DeviceZoneScopedSumN1/N2`).
+- It counts the tile matmuls in each and emits the counts at kernel exit.
+- The run is one eager `sp_only` forward with `TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_SUM=1`: one layer, 5k
+  chunk, Phase 2 schedule (pairs).
+- The figures are math-thread (TRISC 1) cycles per 32×32×32 tile matmul, over all 3072 SDPA cores of the mesh,
+  with matmul + pack inside each zone.
+
+| Point | Expansion | QK | Expansion rate vs QK | Expansion share of SDPA kernel | QK share | SDPA kernel |
+|---|---|---|---|---|---|---|
+| K3 512k | 39.5 cycles (p10–p90 39.1–40.1) | 32.1 | 0.81 | 18.2% | 27.7% | 42.48 ms |
+| K2.7 256k | 43.8 cycles (42.5–45.2) | 32.3 | 0.74 | 19.7% | 27.4% | 14.46 ms |
+
+**What it says:**
+- **QK runs at the FPU's HiFi2 rate.** 32 cycles per tile is two fidelity passes of 16; BH is about 2 k LoFi MACs
+  per cycle. Inside its zone QK has no headroom left.
+- **The expansion runs at 74–81% of that rate.** It would have cleared the waived 60% floor. Its extra 7–12 cycles
+  per tile are the single-tile structure: one output tile per `tile_regs_acquire`, both operands re-unpacked for
+  every tile, and one or two single-tile packs per 16 matmuls. The pack thread spends 37–41 cycles per expansion
+  tile in the same zone, so pack keeps pace and is not the limit.
+- **Ceiling for a blocked expansion matmul**, at QK's rate: 18.2% × (1 − 32.1/39.5) = 3.4% of the SDPA kernel at K3
+  512k (≈ 1.4 ms), 19.7% × (1 − 32.3/43.8) = 5.2% at K2.7 256k (≈ 0.75 ms).
+- **Larger levers**, since the expansion's MAC count is now the cost (≈ 18–20% of the SDPA kernel at full rate):
+  - The expansion matmul at LoFi only. LoFi for all SDPA matmuls cut the program by 17–18%. It would need E1/E2 again.
+  - Groups of 4 (each core expands 1 of 4 no-PE rows). This halves the expansion again, on schedules with 4 Q-chunk
+    cores per head.
+- **Not covered:** the k_pe and peer-row copies, and stalls outside the zones.
+
 ## Next steps
 
-1. Expansion utilisation (author's request, for optimisation): per-zone cycles of the expansion vs QK matmul from the device profiler.
+1. Measure the ring-vs-compute split (per-RISC wait time) for E3's profiler criterion.
 2. E1: an fp32 reference for rotated starts and short → long → short sequences (today checked only against absorbed).
 3. E4: trace the prefetch-off case too.
 4. Phase 3: the chunk retune is done and `_EXPANDED_K_SDPA_CHUNKS` is unchanged. Steady-state traced `sp_only`
