@@ -632,6 +632,11 @@ def test_mla_test_weight_cache_dir_keys(tmp_path, monkeypatch):
     changed["a"][0, 1] += 1
     assert _test_weight_cache_dir(changed, Mesh((8, 4))) != base
     assert _test_weight_cache_dir(weights, Mesh((4, 8))) != base
+    # 0-dim weights hash too, and their value is in the key.
+    scalar = dict(weights, s=torch.tensor(1.5, dtype=torch.bfloat16))
+    assert _test_weight_cache_dir(scalar, Mesh((8, 4))) != _test_weight_cache_dir(
+        dict(scalar, s=torch.tensor(2.5, dtype=torch.bfloat16)), Mesh((8, 4))
+    )
 
 
 def _run_chunked_prefill(
@@ -2706,7 +2711,7 @@ def test_mla_expanded_k_default_selection(request, mesh_device, device_params, v
 
 
 # Unrolled-V accuracy floor (docs/expanded_k/STATUS.md): the V expansion accumulates in fp32. Accumulated in
-# bf16 at HiFi2 it scored K3 0.99322 and K2.7 0.99637 here (main's ring_mla 0.99805 / 0.99738; fp32 0.99826 / 0.99749),
+# bf16 at HiFi2 it scored K3 0.99322 and K2.7 0.99637 here (main's ring_mla 0.99805 / 0.99738; fp32 0.99828 / 0.99751),
 # and the harness's own 0.98 checks would not notice.
 _UNROLLED_V_MIN_PCC = {"kimi_k3": 0.9978, "kimi_k2_7": 0.9968}
 

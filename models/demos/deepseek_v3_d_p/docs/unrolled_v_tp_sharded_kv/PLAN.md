@@ -114,7 +114,7 @@ scenarios, multi-user), plus the K3 KDA-state carry. Determinism repeats are bit
 - `tp_shard_kv=False` stays byte-for-byte on today's path. **Exception (2026-10-18, `71e49173813`):** the V
   expansion now accumulates in fp32 (HiFi2) on every dense chunked MLA path (both layouts, absorbed and expanded K,
   Mistral included). It deliberately changes numerics, recovering 0.001 (K2.7) to 0.005 (K3) output PCC against
-  main's `ring_mla`, for about +1% of the forward (X8's ±1% default-perf bound is re-measured on the new defaults).
+  main's `ring_mla`, for about +0.2% of the forward at HiFi2 (X8's ±1% default-perf bound is re-measured on the new defaults).
 - The feature stays behind `PREFILL_TP_SHARD_KV`, off by default.
 
 ### Non-goals

@@ -1276,8 +1276,8 @@ class ttMLA:
             self.mesh_device.arch(),
             # Each V_h element is a kv_lora_rank-term sum, stored in bf8. Accumulating it in bf16 cost 0.001 (K2.7) to
             # 0.005 (K3) output PCC against main's ring_mla, which keeps V latent; fp32 accumulation recovers it (K3
-            # 0.99322 -> 0.99828, ring_mla 0.99805; expanded_k/STATUS.md). HiFi2 is exact for the bf8 operands: HiFi4
-            # gave the same PCC on K3 and K2.7.
+            # 0.99322 -> 0.99828, ring_mla 0.99805; expanded_k/STATUS.md). HiFi2 is sufficient for the bf8_b operands
+            # (7-bit mantissa): HiFi4 gave the same PCC on K3 and K2.7.
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
