@@ -27,6 +27,9 @@ ring, and V stays unrolled as today.
 
 **Stop and re-plan if** Phase 1's in-situ expansion throughput (MAC/s, from the profiler) is below 60% of the QK
 matmul's MAC/s. At that floor the projected SDPA saving is about 26% (§1), the least that still clears E3.
+**Waived (author, 2026-10-18):** the ratio could not be pinned down inside the fused kernel (estimate 0.43–0.71), and
+E3 itself is met at the end of Phase 2 (−20.7% to −25.1%). The expansion's utilisation is still measured, as an
+optimisation input rather than a gate (STATUS).
 
 ## 1. Why (measured) and what it buys
 

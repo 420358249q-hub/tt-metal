@@ -43,10 +43,10 @@ rev 3.
 - **Phase 2:** X1–X8 all hold. This is the merge point.
 - **Phase 3 (optional):** traced-replay overhead ≤ +0.5% at all four points, with X2–X4 and X8 still holding.
   Otherwise the overlap isn't merged. Outcome (§4.4 rev 5): met at K3 50k, K3 512k and K2.7 256k. K2.7 50k stays at
-  +1.2% mean (serial +1.7% mean): the gather there is fixed latency that concurrency does not hide. **Open decision
-  for the author:** the overlap is committed on by default as a deliberate exception to this rule, since it is not slower
-  than serial on average anywhere and removes ≈0.8–1.4 pp (means) at 256k–512k. The alternative is opt-in
-  (`PREFILL_TP_LATENT_PREFETCH`).
+  +1.2% mean (serial +1.7% mean): the gather there is fixed latency that concurrency does not hide. **Decided by the
+  author (2026-10-18):** the overlap stays on by default as a deliberate exception to this rule. It is not slower than
+  serial on average anywhere and removes ≈0.8–1.4 pp (means) at 256k–512k; `PREFILL_TP_LATENT_PREFETCH=0` turns it
+  off.
 
 **Stop and re-plan if:**
 - any of X2 or X4 fails for a reason other than a bug;
@@ -307,7 +307,7 @@ whole SP-local latent (`tt_kvpe`). So:
   - The load/clear is not the cost: a region without the gather is no slower than `sp_only`.
   - Moving the gather to the SDPA's idle row 9 (`ring_sdpa_compute_grid` 11×9), or using one link, changes nothing.
 - The Phase 3 exit (≤ +0.5% at all four points) is met at three of four points. K2.7 50k misses it; there the prefetch
-  is within noise of serial and lower on average. See the open decision in §0.
+  is within noise of serial and lower on average. The author kept it on by default (§0).
 
 ### 4.5 Tests, perf, CI (in Phase 2, re-run after Phase 3)
 **Model**
