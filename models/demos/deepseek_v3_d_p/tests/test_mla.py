@@ -784,7 +784,10 @@ def _run_chunked_prefill(
             ref_out, ref_kvpe = cpu_mla_reference(config, weights, hidden)
         else:  # None -> functional / perf, no reference
             torch.manual_seed(100 + u)
-            hidden = torch.randn(total_len, hidden_size, dtype=torch.bfloat16)
+            # Random rows only past the prefix: a 512k prefix would otherwise draw ~3.8G values on the host (about two
+            # minutes). A gather that reaches back into the prefix reads zeros; this mode compares with no reference.
+            hidden = torch.zeros(total_len, hidden_size, dtype=torch.bfloat16)
+            hidden[prefill_len:] = torch.randn(total_len - prefill_len, hidden_size, dtype=torch.bfloat16)
             ref_out, ref_kvpe = None, None
 
         if prefill_len == 0:
