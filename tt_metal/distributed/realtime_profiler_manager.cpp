@@ -37,7 +37,7 @@
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_device_view.hpp>
 #include <tt-metalium/tt_align.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include <tt_metal.hpp>
 #include <umd/device/types/core_coordinates.hpp>
 #include <umd/device/types/xy_pair.hpp>
@@ -604,7 +604,7 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
             continue;
         }
 
-        IDevice* device = experimental::MeshDevice::get_device(*mesh_device, coord);
+        IDevice* device = internal::get_device(*mesh_device, coord);
         auto device_id = device->id();
 
         auto eligibility = evaluate_realtime_profiler_eligibility(device, context_id_);

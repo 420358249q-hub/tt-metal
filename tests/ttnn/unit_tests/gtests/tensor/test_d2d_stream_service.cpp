@@ -56,7 +56,7 @@
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/tt_metal.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include <tt_stl/small_vector.hpp>
 #include <umd/device/types/arch.hpp>
 
@@ -271,7 +271,7 @@ void verify_transfer(
     std::vector<uint32_t> trigger{num_workers};
     for (const auto& coord : coords) {
         tt::tt_metal::detail::WriteToDeviceL1(
-            tt::tt_metal::experimental::MeshDevice::get_device(*sender_mesh, coord),
+            tt::tt_metal::internal::get_device(*sender_mesh, coord),
             sender->get_service_core(coord),
             static_cast<uint32_t>(sender->get_data_ready_counter_addr(coord)),
             trigger);
@@ -346,7 +346,7 @@ public:
         ++num_sent_;
         std::vector<uint32_t> trigger{num_sent_ * num_workers_};
         for (const auto& coord : coords_) {
-            auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*sender_mesh_, coord);
+            auto* d = tt::tt_metal::internal::get_device(*sender_mesh_, coord);
             tt::tt_metal::detail::WriteToDeviceL1(
                 d, sender_->get_service_core(coord), static_cast<uint32_t>(sender_->get_metadata_addr(coord)), md);
             tt::tt_metal::detail::WriteToDeviceL1(
@@ -361,7 +361,7 @@ public:
     uint32_t released(const MeshCoordinate& coord) const {
         std::vector<uint32_t> v;
         tt::tt_metal::detail::ReadFromDeviceL1(
-            tt::tt_metal::experimental::MeshDevice::get_device(*receiver_mesh_, coord),
+            tt::tt_metal::internal::get_device(*receiver_mesh_, coord),
             receiver_->get_worker_cores().start_coord,
             static_cast<uint32_t>(receiver_->get_data_ready_sem_addr()),
             sizeof(uint32_t),
@@ -387,7 +387,7 @@ public:
         std::vector<uint32_t> value{num_consumed_ * num_workers_};
         for (const auto& coord : coords_) {
             tt::tt_metal::detail::WriteToDeviceL1(
-                tt::tt_metal::experimental::MeshDevice::get_device(*receiver_mesh_, coord),
+                tt::tt_metal::internal::get_device(*receiver_mesh_, coord),
                 receiver_->get_service_core(coord),
                 static_cast<uint32_t>(receiver_->get_consumed_counter_addr(coord)),
                 value);
@@ -455,7 +455,7 @@ void verify_stage_gate_descriptor(
         }
         EXPECT_EQ(
             desc.service_core_noc,
-            tt::tt_metal::experimental::MeshDevice::get_device(*receiver_mesh, coord)
+            tt::tt_metal::internal::get_device(*receiver_mesh, coord)
                 ->worker_core_from_logical_core(receiver->get_service_core(coord)));
         EXPECT_EQ(desc.fabric_node_id, receiver_mesh->get_fabric_node_id(coord));
         for (uint32_t g = 0; g < kGateNumGates; ++g) {
@@ -668,7 +668,7 @@ MeshWorkload make_sender_worker_workload(
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = ct_args});
 
-        auto* device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh, coord);
+        auto* device = tt::tt_metal::internal::get_device(*mesh, coord);
         const auto service_phys = device->worker_core_from_logical_core(sender->get_service_core(coord));
         const uint32_t md_addr = metadata_enabled ? static_cast<uint32_t>(sender->get_metadata_addr(coord)) : 0u;
         for (const auto& wc : worker_cores) {
@@ -709,7 +709,7 @@ MeshWorkload make_receiver_worker_workload(
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = ct_args});
 
-        auto* device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh, coord);
+        auto* device = tt::tt_metal::internal::get_device(*mesh, coord);
         const auto service_phys = device->worker_core_from_logical_core(receiver->get_service_core(coord));
         const std::vector<uint32_t> rt_args = {
             static_cast<uint32_t>(receiver->get_consumed_counter_addr(coord)),
@@ -751,7 +751,7 @@ void verify_metadata_sender_write(
     for (const auto& coord : sender->get_backing_tensor().tensor_topology().mesh_coords()) {
         readback.clear();
         tt::tt_metal::detail::ReadFromDeviceL1(
-            tt::tt_metal::experimental::MeshDevice::get_device(*sender_mesh, coord),
+            tt::tt_metal::internal::get_device(*sender_mesh, coord),
             sender->get_service_core(coord),
             static_cast<uint32_t>(sender->get_metadata_addr(coord)),
             md_bytes,
@@ -955,7 +955,7 @@ void verify_fabric_lease_teardown_mid_transfer(
     std::vector<uint32_t> trigger{core_range_volume(sender->get_worker_cores())};
     for (const auto& coord : coords) {
         tt::tt_metal::detail::WriteToDeviceL1(
-            tt::tt_metal::experimental::MeshDevice::get_device(*sender_mesh, coord),
+            tt::tt_metal::internal::get_device(*sender_mesh, coord),
             sender->get_service_core(coord),
             static_cast<uint32_t>(sender->get_data_ready_counter_addr(coord)),
             trigger);
@@ -968,7 +968,7 @@ void verify_fabric_lease_teardown_mid_transfer(
         for (const auto& coord : coords) {
             v.clear();
             tt::tt_metal::detail::ReadFromDeviceL1(
-                tt::tt_metal::experimental::MeshDevice::get_device(*receiver_mesh, coord),
+                tt::tt_metal::internal::get_device(*receiver_mesh, coord),
                 receiver->get_worker_cores().start_coord,
                 static_cast<uint32_t>(receiver->get_data_ready_sem_addr()),
                 sizeof(uint32_t),
@@ -1007,7 +1007,7 @@ void expect_metadata_on_receiver_workers(
     const CoreRange recv_workers = receiver->get_worker_cores();
     std::vector<uint32_t> rb;
     for (const auto& coord : receiver->get_backing_tensor().tensor_topology().mesh_coords()) {
-        auto* device = tt::tt_metal::experimental::MeshDevice::get_device(*receiver_mesh, coord);
+        auto* device = tt::tt_metal::internal::get_device(*receiver_mesh, coord);
         for (const auto& wc : recv_workers) {
             rb.clear();
             tt::tt_metal::detail::ReadFromDeviceL1(device, wc, recv_md_addr, md_bytes, rb);
@@ -1032,7 +1032,7 @@ void expect_metadata_everywhere(
     for (const auto& coord : sender->get_backing_tensor().tensor_topology().mesh_coords()) {
         rb.clear();
         tt::tt_metal::detail::ReadFromDeviceL1(
-            tt::tt_metal::experimental::MeshDevice::get_device(*sender_mesh, coord),
+            tt::tt_metal::internal::get_device(*sender_mesh, coord),
             sender->get_service_core(coord),
             static_cast<uint32_t>(sender->get_metadata_addr(coord)),
             md_bytes,
@@ -1215,7 +1215,7 @@ public:
         control_addr_ = static_cast<uint32_t>(control_buffer_->address());
         for (const auto& coord : coords_) {
             tt::tt_metal::detail::WriteToDeviceL1(
-                tt::tt_metal::experimental::MeshDevice::get_device(*mesh_, coord), worker_, control_addr_, control);
+                tt::tt_metal::internal::get_device(*mesh_, coord), worker_, control_addr_, control);
         }
 
         auto workload = make_workload(sender, static_cast<uint32_t>(chunks.size()));
@@ -1227,7 +1227,7 @@ public:
         std::vector<uint32_t> go{n};
         for (const auto& coord : coords_) {
             tt::tt_metal::detail::WriteToDeviceL1(
-                tt::tt_metal::experimental::MeshDevice::get_device(*mesh_, coord), worker_, control_addr_, go);
+                tt::tt_metal::internal::get_device(*mesh_, coord), worker_, control_addr_, go);
         }
     }
 
@@ -1239,10 +1239,7 @@ public:
         std::vector<uint32_t> cancel{1u};
         for (const auto& coord : coords_) {
             tt::tt_metal::detail::WriteToDeviceL1(
-                tt::tt_metal::experimental::MeshDevice::get_device(*mesh_, coord),
-                worker_,
-                control_addr_ + sizeof(uint32_t),
-                cancel);
+                tt::tt_metal::internal::get_device(*mesh_, coord), worker_, control_addr_ + sizeof(uint32_t), cancel);
         }
         Finish(mesh_->mesh_command_queue());
     }
@@ -1287,7 +1284,7 @@ private:
                 CoreRange{worker_, worker_},
                 DataMovementConfig{
                     .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = ct_args});
-            const auto service = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_, coord)
+            const auto service = tt::tt_metal::internal::get_device(*mesh_, coord)
                                      ->worker_core_from_logical_core(sender->get_service_core(coord));
             SetRuntimeArgs(
                 program,
@@ -1554,7 +1551,7 @@ MeshWorkload make_receiver_consumer_workload(
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = ct_args});
 
-        auto* device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh, coord);
+        auto* device = tt::tt_metal::internal::get_device(*mesh, coord);
         const auto service_phys = device->worker_core_from_logical_core(receiver->get_service_core(coord));
         for (const auto& wc : worker_cores) {
             const auto [start_page, end_page] =
@@ -1662,7 +1659,7 @@ MeshWorkload make_bridge_workload(
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = ct_args});
 
-        auto* device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh, coord);
+        auto* device = tt::tt_metal::internal::get_device(*mesh, coord);
         const auto h2d_service_phys = device->worker_core_from_logical_core(upstream.get_service_core(coord));
         const auto d2d_service_phys = device->worker_core_from_logical_core(d2d_sender->get_service_core(coord));
         const uint32_t d2d_md_addr =

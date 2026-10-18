@@ -18,7 +18,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include <ranges>
 #include <optional>
 #include <algorithm>
@@ -169,7 +169,7 @@ ProgramDescriptor build_program_descriptor(
     const auto& mesh_view = mesh_device->get_view();
     TT_FATAL(
         mesh_view.is_mesh_2d(), "all-gather invoked with cluster_axis API on >2D mesh, which is currently unsupported");
-    IDevice* target_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate);
+    IDevice* target_device = tt::tt_metal::internal::get_device(*mesh_device, mesh_coordinate);
 
     std::vector<IDevice*> devices = (operation_attributes.cluster_axis == 0)
                                         ? mesh_view.get_devices_on_column(mesh_coordinate[1])

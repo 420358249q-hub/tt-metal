@@ -25,7 +25,7 @@
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/experimental/sockets/d2h_socket.hpp>
 #include <tt-metalium/experimental/sockets/mesh_socket.hpp>  // MeshCoreCoord
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include <umd/device/types/core_coordinates.hpp>
 
 #include "context/metal_context.hpp"
@@ -226,7 +226,7 @@ std::vector<CapturedDevice> Devices::boot(const std::shared_ptr<distributed::Mes
             continue;
         }
         DeviceCtx ctx;
-        ctx.device = experimental::MeshDevice::get_device(*mesh_device, coord);
+        ctx.device = internal::get_device(*mesh_device, coord);
         ctx.chip_id = static_cast<uint32_t>(ctx.device->id());
         if (!boot_device(mesh_device, ctx, coord)) {
             log_warning(

@@ -21,7 +21,7 @@
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/math.hpp>
 #include <tt-metalium/constants.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 #include <algorithm>
 #include <sstream>
@@ -121,7 +121,7 @@ ProgramDescriptor AllReduceCreateQkvHeadsMeshWorkloadFactory::create_descriptor(
     auto* mesh_device = input_tensor.device();
     const auto& mesh_view = mesh_device->get_view();
 
-    auto* const target_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coord);
+    auto* const target_device = tt::tt_metal::internal::get_device(*mesh_device, mesh_coord);
     std::vector<IDevice*> devices = (operation_attributes.cluster_axis == 0)
                                         ? mesh_view.get_devices_on_column(mesh_coord[1])
                                         : mesh_view.get_devices_on_row(mesh_coord[0]);

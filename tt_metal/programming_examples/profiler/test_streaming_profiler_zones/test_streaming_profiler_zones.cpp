@@ -32,7 +32,7 @@
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/experimental/streaming_profiler.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
         static const char* const kRisc[5] = {"BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2"};
         std::vector<uint32_t> slots(10, 0);
         detail::ReadFromDeviceL1(
-            experimental::MeshDevice::get_device(
+            internal::get_device(
                 *mesh_device, distributed::MeshCoordinate::zero_coordinate(mesh_device->shape().dims())),
             CoreCoord{0, 0},
             kBenchAddr,

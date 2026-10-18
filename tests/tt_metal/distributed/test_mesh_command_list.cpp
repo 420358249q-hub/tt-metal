@@ -25,7 +25,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/sub_device.hpp>
 #include <tt-metalium/tt_metal.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 #include "tests/tt_metal/tt_metal/api/metal2_host_api/test_helpers.hpp"
 #include "tests/tt_metal/tt_metal/common/multi_device_fixture.hpp"
@@ -35,7 +35,6 @@ namespace {
 
 namespace m2 = tt::tt_metal::experimental;
 using namespace tt::tt_metal::distributed;
-using distributed::MeshDevice;
 
 using m2::test_helpers::BindTensorParameterToKernel;
 using m2::test_helpers::MakeMinimalDFB;
@@ -171,7 +170,7 @@ MeshWorkload make_l1_write_workload(
 IDevice* device(const std::shared_ptr<MeshDevice>& mesh_device) { return mesh_device->get_devices().at(0); }
 
 IDevice* device(const std::shared_ptr<MeshDevice>& mesh_device, const MeshCoordinate& device_coord) {
-    return experimental::MeshDevice::get_device(*mesh_device, device_coord);
+    return internal::get_device(*mesh_device, device_coord);
 }
 
 void write_l1(const std::shared_ptr<MeshDevice>& mesh_device, uint32_t address, uint32_t value) {

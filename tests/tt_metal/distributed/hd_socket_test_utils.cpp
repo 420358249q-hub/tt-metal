@@ -4,13 +4,13 @@
 
 #include "hd_socket_test_utils.hpp"
 #include "tt_metal/fabric/physical_system_discovery.hpp"
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 namespace tt::tt_metal::distributed {
 
 bool is_device_coord_mmio_mapped(const std::shared_ptr<MeshDevice>& mesh_device, const MeshCoordinate& device_coord) {
     const auto& cluster = MetalContext::instance().get_cluster();
-    auto device_id = experimental::MeshDevice::get_device(*mesh_device, device_coord)->id();
+    auto device_id = internal::get_device(*mesh_device, device_coord)->id();
     return cluster.get_associated_mmio_device(device_id) == device_id;
 }
 
@@ -44,7 +44,7 @@ uint64_t read_l1_uint64(const MeshDevice& device, const MeshCoreCoord& core, uin
         &val,
         sizeof(uint64_t),
         tt_cxy_pair(
-            experimental::MeshDevice::get_device(device, core.device_coord)->id(),
+            internal::get_device(device, core.device_coord)->id(),
             device.worker_core_from_logical_core(core.core_coord)),
         addr);
     return val;
@@ -55,13 +55,13 @@ void read_l1_uint64s(const MeshDevice& device, const MeshCoreCoord& core, uint64
         out.data(),
         out.size() * sizeof(uint64_t),
         tt_cxy_pair(
-            experimental::MeshDevice::get_device(device, core.device_coord)->id(),
+            internal::get_device(device, core.device_coord)->id(),
             device.worker_core_from_logical_core(core.core_coord)),
         addr);
 }
 
 double get_cycles_per_us(const MeshDevice& mesh_device) {
-    auto chip_id = experimental::MeshDevice::get_device(mesh_device, MeshCoordinate(0, 0))->id();
+    auto chip_id = internal::get_device(mesh_device, MeshCoordinate(0, 0))->id();
     return static_cast<double>(MetalContext::instance().get_cluster().get_device_aiclk(chip_id));
 }
 

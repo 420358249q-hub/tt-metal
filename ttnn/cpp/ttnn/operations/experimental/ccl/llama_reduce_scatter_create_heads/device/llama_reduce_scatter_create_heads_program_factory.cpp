@@ -14,7 +14,7 @@
 #include "ttnn/operations/ccl/common/host/ccl_worker_builder.hpp"
 #include <tt-metalium/sub_device.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 namespace ttnn::operations::experimental::ccl {
 
@@ -302,7 +302,7 @@ LlamaReduceScatterCreateHeadsDeviceOperation::LlamaReduceScatterCreateHeads::cre
         (operation_attributes.cluster_axis == 0) ? mesh_view.num_rows() : mesh_view.num_cols();
     TT_FATAL(ring_devices > 1, "reduce_scatter async op will only work for ring_devices > 1, but has {}", ring_devices);
 
-    auto* target_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate);
+    auto* target_device = tt::tt_metal::internal::get_device(*mesh_device, mesh_coordinate);
 
     const uint32_t ring_size = operation_attributes.ring_devices;
     const uint32_t num_devices = ring_size;

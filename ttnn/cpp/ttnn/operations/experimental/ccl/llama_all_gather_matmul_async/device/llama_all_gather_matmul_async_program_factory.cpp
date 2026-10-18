@@ -14,7 +14,7 @@
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 #include "ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp"
 #include "ttnn/operations/ccl/shared_with_host/hetergeneous_data_structs.hpp"
@@ -66,7 +66,7 @@ LlamaAllGatherMatmulAsyncProgramFactory::cached_program_t LlamaAllGatherMatmulAs
     const auto& global_cb = args.matmul_struct.global_cb;
 
     auto* mesh_device = input0.device();
-    IDevice* sender_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate);
+    IDevice* sender_device = tt::tt_metal::internal::get_device(*mesh_device, mesh_coordinate);
 
     const auto& mesh_view = mesh_device->get_view();
     std::vector<IDevice*> devices_to_use = {};

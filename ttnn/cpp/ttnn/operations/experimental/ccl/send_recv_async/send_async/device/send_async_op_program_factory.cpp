@@ -16,7 +16,7 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/tt_align.hpp>
 #include <tt-metalium/math.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include "ttnn/operations/experimental/ccl/send_recv_async/send_recv_utils.hpp"
 using namespace tt::constants;
 
@@ -50,9 +50,8 @@ SendAsyncMeshWorkloadFactory::create_at(
     auto mesh_socket = operation_attributes.mesh_socket;
     const auto& input_tensor = tensor_args;
     auto* mesh_device = input_tensor.device();
-    IDevice* target_device = mesh_device
-                                 ? tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate)
-                                 : tensor_args.device();
+    IDevice* target_device =
+        mesh_device ? tt::tt_metal::internal::get_device(*mesh_device, mesh_coordinate) : tensor_args.device();
 
     tt::tt_metal::Program program{};
     const auto* socket_mesh_device = mesh_socket.get_config_buffer()->device();
@@ -71,8 +70,8 @@ SendAsyncMeshWorkloadFactory::create_at(
 
     for (size_t conn_idx = 0; conn_idx < socket_connection_config.size(); ++conn_idx) {
         const auto& connection = socket_connection_config[conn_idx];
-        if (tt::tt_metal::experimental::MeshDevice::get_device(*socket_mesh_device, connection.sender_core.device_coord)
-                ->id() == target_device->id()) {
+        if (tt::tt_metal::internal::get_device(*socket_mesh_device, connection.sender_core.device_coord)->id() ==
+            target_device->id()) {
             sender_core_coords.push_back(connection.sender_core.core_coord);
             receiver_core_coords.push_back(connection.receiver_core.core_coord);
             sender_fabric_node_ids.push_back(
@@ -224,8 +223,8 @@ SendAsyncMeshWorkloadFactory::create_at(
         uint32_t bank_id = 0;
         if (!socket_storage_in_dram) {
             const auto& connection = socket_connection_config[connection_indices[core_idx]];
-            auto* receiver_device = tt::tt_metal::experimental::MeshDevice::get_device(
-                *socket_mesh_device, connection.receiver_core.device_coord);
+            auto* receiver_device =
+                tt::tt_metal::internal::get_device(*socket_mesh_device, connection.receiver_core.device_coord);
             bank_id = receiver_device->allocator()->get_bank_ids_from_logical_core(
                 mesh_socket.get_config().socket_mem_config.socket_storage_type, receiver_core_coord)[0];
         } else {

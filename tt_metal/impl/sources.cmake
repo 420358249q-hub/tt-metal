@@ -20,7 +20,6 @@ set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/profiler_initializer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/firmware/risc_firmware_initializer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/experimental/device.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/device/experimental/mesh_device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/mock_device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device/mock_device_util.cpp
@@ -132,6 +131,7 @@ set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/dispatch_core_common.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/dispatch_engine_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/cluster_noc_helpers.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/internal/mesh_device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/service/service_core_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/simple_trace_allocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/dispatch_core_manager.cpp

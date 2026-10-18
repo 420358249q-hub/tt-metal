@@ -15,7 +15,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 
 #include "ttnn/operations/math.hpp"
 #include "ttnn/operations/ccl/shared_with_host/hetergeneous_data_structs.hpp"
@@ -59,8 +59,8 @@ SliceReshardAsyncProgramFactory::cached_program_t SliceReshardAsyncProgramFactor
     tt::tt_metal::Program program{};
 
     auto* mesh_device = input_tensor.device();
-    IDevice* sender_device = mesh_device ? tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coord)
-                                         : input_tensor.device();
+    IDevice* sender_device =
+        mesh_device ? tt::tt_metal::internal::get_device(*mesh_device, mesh_coord) : input_tensor.device();
     std::vector<IDevice*> devices_to_use = {};
     const auto& mesh_view = input_tensor.device()->get_view();
     // User specified the cluster-axis. Derive devices based on the current coordinate

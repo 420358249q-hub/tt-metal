@@ -18,7 +18,7 @@
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
 #include <tt-metalium/math.hpp>
-#include <tt-metalium/experimental/mesh_device.hpp>
+#include <internal/mesh_device.hpp>
 #include "tt-metalium/hal.hpp"
 #include "ttnn/types.hpp"
 #include "ttnn/distributed/types.hpp"
@@ -461,7 +461,7 @@ std::vector<IDevice*> get_active_physical_devices(const Tensor& tensor) {
     std::vector<IDevice*> devices = {};
     devices.reserve(tensor.device_storage().get_coords().size());
     for (const auto& coord : tensor.device_storage().get_coords()) {
-        devices.push_back(tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, coord));
+        devices.push_back(tt::tt_metal::internal::get_device(*mesh_device, coord));
     }
     return devices;
 }
@@ -473,7 +473,7 @@ std::vector<IDevice*> get_active_physical_devices(const std::vector<Tensor>& ten
         TT_FATAL(
             tensor.device()->shape().mesh_size() == 1,
             "Running a CCL over individual tensor shards requires the shards to be allocated on unit-meshes.");
-        devices.push_back(tt::tt_metal::experimental::MeshDevice::get_device(*tensor.device(), MeshCoordinate(0, 0)));
+        devices.push_back(tt::tt_metal::internal::get_device(*tensor.device(), MeshCoordinate(0, 0)));
     }
     return devices;
 }
