@@ -592,7 +592,7 @@ def _weights_digest(key, weights):
     for name in sorted(weights):
         t = weights[name]
         key.update(f"{name}{tuple(t.shape)}{t.dtype}".encode())
-        key.update(t.detach().contiguous().view(torch.uint8).numpy())
+        key.update(t.detach().reshape(-1).contiguous().view(torch.uint8).numpy())
 
 
 def _test_weight_cache_dir(weights, mesh_device):
