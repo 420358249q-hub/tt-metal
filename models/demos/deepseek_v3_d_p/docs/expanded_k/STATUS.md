@@ -156,12 +156,29 @@ Measured at the author's request, as input for optimisation, not as a gate.
 - **Blocked expansion tried and rejected (2026-10-18).** The test version used `matmul_block` over a DST block of
   W_UK rows × K tiles: the latent tile was reused across the block, and W_UK was streamed with
   `matmul_set_in1_column_stride(latent_rows)`.
-  - Correct: the paired tests passed at unchanged PCC.
+  - Correct: the 6 `sp_only` paired cases run (5k, pad-overflow and 2k prefix, both models) passed at unchanged PCC.
   - Only ~3% faster per tile, so the single-tile hypothesis above is mostly wrong. Math-thread cycles per tile fell
     to 38.2 for K3 512k (was 39.5) and 42.4 for K2.7 256k (was 43.8).
-  - End to end, all 16 expanded-KV matrix cells stayed within ±0.7% of before, which is noise.
+  - End to end, all 16 expanded-KV matrix cells moved within ±1.3% of before (±0.5% at KV 512k), in both
+    directions, which is noise.
   - Reverted. The remaining gap to QK is untested. It could be the strided W_UK stream, the 16-tile inner sums, or
     the scattered single-tile packs; closing it needs unpack-side instrumentation.
+  - The same blocks on SDPA's no-MOP matmul (`sdpa_mm_init` / `sdpa_matmul_block_no_mop`, as QK and PV use) were
+    no faster: 39.1 (K3) and 43.3 (K2.7) cycles per tile.
+- **The copies around the expansion cost more than the matmul's gap to QK.**
+  - The whole of `sdpa_expand_k_chunk` takes 22.9% (K3 512k) and 24.2% (K2.7 256k) of the SDPA kernel, against 18.0%
+    and 19.5% for its matmul loop alone. Measured on the no-MOP blocked version.
+  - A split on the committed kernel (K2.7 256k) puts the k_pe and peer-row copies at 4.3% of the kernel (math
+    thread). Waiting for the peer's rows is ≈ 0%.
+  - That is 32 tile copies per K chunk against 256 tile matmuls, so each copy costs about 1.8 matmul tiles. Each
+    `copy_tile` runs its own acquire / commit / wait / pack / release, so the unpack, math and pack stages never
+    overlap.
+  - Levers, smallest first:
+    - Batch the copies, up to 8 tiles per DST acquire.
+    - Expand in place: pack the no-PE rows next to k_pe in the latent chunk through an alias CB, so the QK reads
+      K^T in place. That removes the k_pe copy and `cb_kexp`.
+    - With pairs, the peer writes its rows straight into that chunk, which removes the peer copy and the second
+      pack into `cb_own`.
 - **Larger levers**, since the expansion's MAC count is now the cost (18–20% of the SDPA kernel today, ≈ 15% at
   QK's rate):
   - The expansion matmul at LoFi only. LoFi for all SDPA matmuls cut the program by 17–18%. It would need E1/E2 again.
