@@ -153,6 +153,15 @@ Measured at the author's request, as input for optimisation, not as a gate.
     thread's 37–41 cycles is per tile matmul in the same zone, mostly waiting.
 - **Ceiling for a blocked expansion matmul**, at QK's rate: 18.2% × (1 − 32.1/39.5) = 3.4% of the SDPA kernel at K3
   512k (≈ 1.4 ms), 19.7% × (1 − 32.3/43.8) = 5.2% at K2.7 256k (≈ 0.75 ms).
+- **Blocked expansion tried and rejected (2026-10-18).** The test version used `matmul_block` over a DST block of
+  W_UK rows × K tiles: the latent tile was reused across the block, and W_UK was streamed with
+  `matmul_set_in1_column_stride(latent_rows)`.
+  - Correct: the paired tests passed at unchanged PCC.
+  - Only ~3% faster per tile, so the single-tile hypothesis above is mostly wrong. Math-thread cycles per tile fell
+    to 38.2 for K3 512k (was 39.5) and 42.4 for K2.7 256k (was 43.8).
+  - End to end, all 16 expanded-KV matrix cells stayed within ±0.7% of before, which is noise.
+  - Reverted. The remaining gap to QK is untested. It could be the strided W_UK stream, the 16-tile inner sums, or
+    the scattered single-tile packs; closing it needs unpack-side instrumentation.
 - **Larger levers**, since the expansion's MAC count is now the cost (18–20% of the SDPA kernel today, ≈ 15% at
   QK's rate):
   - The expansion matmul at LoFi only. LoFi for all SDPA matmuls cut the program by 17–18%. It would need E1/E2 again.
