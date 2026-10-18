@@ -20,6 +20,7 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/workload_descriptor.hpp>
 #include <tt-metalium/math.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include "ttnn/operations/ccl/common/types/ccl_types_args_emitters.hpp"
 #include "ttnn/operations/ccl/common/host/ccl_command_stream_builders.hpp"
 #include "ttnn/operations/ccl/common/uops/command_lowering.hpp"
@@ -84,7 +85,7 @@ ProgramDescriptor build_rms_allgather_program_descriptor(
     Tensor& tensor_return_value) {
     // Setup device information
     ttnn::MeshDevice* mesh_device = tensor_args.input.device();
-    auto* const target_device = mesh_device->get_device(mesh_coord);
+    auto* const target_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coord);
     const auto mesh_view = mesh_device->get_view();
     TT_FATAL(
         mesh_view.is_mesh_2d(), "all-gather invoked with cluster_axis API on >2D mesh, which is currently unsupported");

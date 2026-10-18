@@ -37,6 +37,7 @@
 #include <tt-metalium/experimental/sockets/d2h_stream_service_descriptor.hpp>
 #include <tt-metalium/experimental/sockets/hd_socket_descriptor.hpp>
 #include <tt-metalium/experimental/sockets/shm_resource_tracker.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include "ttnn/distributed/distributed_tensor.hpp"
 #include "ttnn/global_semaphore.hpp"
 
@@ -381,7 +382,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
 
     auto& svc = tt::tt_metal::internal::service_core_manager(*mesh_device_);
     for (const auto& coord : coords) {
-        auto* d = mesh_device_->get_device(coord);
+        auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
         auto claimable = svc.get_claimable_cores(d);
         TT_FATAL(!claimable.empty(), "D2HStreamService: no claimable service core on device at coord {}", coord);
         const CoreCoord chosen = claimable.front();
@@ -405,7 +406,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
     // Derive the chunk plan BEFORE constructing sockets, so socket_page_size is known in time
     // to set on the sockets. L1 layout is uniform across coords, so a representative service
     // core suffices.
-    auto* rep_device = mesh_device_->get_device(coords.front());
+    auto* rep_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coords.front());
     const uint64_t service_core_free_l1 = svc.bytes_available(rep_device, service_cores_.at(coords.front()));
     const uint64_t usable_cb_l1 = service_core_cb_l1_budget(service_core_free_l1);
 
@@ -474,7 +475,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
 
     std::vector<uint32_t> zero_word{0};
     for (const auto& coord : coords) {
-        auto* d = mesh_device_->get_device(coord);
+        auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
         const CoreCoord chosen = service_cores_.at(coord);
         const DeviceAddr sem_addr = svc.allocate_l1(d, chosen, sizeof(uint32_t));
         termination_addrs_.emplace(coord, sem_addr);
@@ -482,7 +483,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
     }
 
     for (const auto& coord : coords) {
-        auto* d = mesh_device_->get_device(coord);
+        auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
         const CoreCoord chosen = service_cores_.at(coord);
         const DeviceAddr addr = svc.allocate_l1(d, chosen, sizeof(uint32_t));
         write_ack_addrs_.emplace(coord, addr);
@@ -526,7 +527,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
         const DeviceAddr aligned_metadata_size =
             tt::align(static_cast<DeviceAddr>(cfg_.metadata_size_bytes), static_cast<DeviceAddr>(l1_align));
         for (const auto& coord : coords) {
-            auto* d = mesh_device_->get_device(coord);
+            auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
             const CoreCoord chosen = service_cores_.at(coord);
             const DeviceAddr addr = svc.allocate_l1(d, chosen, aligned_metadata_size);
             metadata_input_addrs_.emplace(coord, addr);
@@ -552,7 +553,7 @@ D2HStreamService::D2HStreamService(const std::shared_ptr<distributed::MeshDevice
         worker_sync.num_workers = num_workers_;
         if (cfg_.worker_cores.has_value()) {
             const auto& worker_range = cfg_.worker_cores.value();
-            auto* d = mesh_device_->get_device(core.device_coord);
+            auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, core.device_coord);
             const auto start_phys = d->worker_core_from_logical_core(worker_range.start_coord);
             const auto end_phys = d->worker_core_from_logical_core(worker_range.end_coord);
             worker_sync.enabled = true;
@@ -642,18 +643,18 @@ D2HStreamService::~D2HStreamService() {
         if (device_live) {
             auto& svc = tt::tt_metal::internal::service_core_manager(*mesh_device_);
             for (const auto& [coord, core] : service_cores_) {
-                auto* d = mesh_device_->get_device(coord);
+                auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
                 svc.wait_done(d, core);
             }
 
             for (const auto& [coord, addr] : termination_addrs_) {
-                auto* d = mesh_device_->get_device(coord);
+                auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
                 svc.deallocate_l1(d, service_cores_.at(coord), addr);
             }
             termination_addrs_.clear();
 
             for (const auto& [coord, addr] : write_ack_addrs_) {
-                auto* d = mesh_device_->get_device(coord);
+                auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
                 svc.deallocate_l1(d, service_cores_.at(coord), addr);
             }
             write_ack_addrs_.clear();
@@ -662,7 +663,7 @@ D2HStreamService::~D2HStreamService() {
             metadata_worker_l1_addr_ = 0;
 
             for (const auto& [coord, addr] : metadata_input_addrs_) {
-                auto* d = mesh_device_->get_device(coord);
+                auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
                 svc.deallocate_l1(d, service_cores_.at(coord), addr);
             }
             metadata_input_addrs_.clear();
@@ -670,7 +671,7 @@ D2HStreamService::~D2HStreamService() {
             sockets_.clear();
 
             for (const auto& [coord, core] : service_cores_) {
-                auto* d = mesh_device_->get_device(coord);
+                auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
                 svc.release(d, {core});
             }
 
@@ -864,7 +865,7 @@ void D2HStreamService::notify_backing_ready() {
         "Config::worker_cores is set");
     TT_FATAL(mesh_device_ != nullptr, "D2HStreamService::notify_backing_ready: mesh device unavailable");
     for (const auto& [coord, addr] : write_ack_addrs_) {
-        auto* d = mesh_device_->get_device(coord);
+        auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
         const CoreCoord chosen = service_cores_.at(coord);
         std::vector<uint32_t> cur(1);
         tt::tt_metal::detail::ReadFromDeviceL1(d, chosen, static_cast<uint32_t>(addr), sizeof(uint32_t), cur);
@@ -885,7 +886,7 @@ void D2HStreamService::signal_termination() {
     }
     std::vector<uint32_t> one_word{1};
     for (const auto& [coord, addr] : termination_addrs_) {
-        auto* d = mesh_device_->get_device(coord);
+        auto* d = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device_, coord);
         const CoreCoord chosen = service_cores_.at(coord);
         tt::tt_metal::detail::WriteToDeviceL1(d, chosen, static_cast<uint32_t>(addr), one_word);
     }

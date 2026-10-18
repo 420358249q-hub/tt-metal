@@ -40,6 +40,7 @@
 
 namespace tt::tt_metal::experimental {
 using namespace tt::tt_metal::distributed;
+using distributed::MeshDevice;
 
 namespace detail {
 

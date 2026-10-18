@@ -18,6 +18,7 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/tt_align.hpp>
 #include <tt-metalium/math.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include "ttnn/operations/experimental/ccl/send_recv_async/send_recv_utils.hpp"
 
 using namespace tt::constants;
@@ -51,7 +52,9 @@ RecvAsyncMeshWorkloadFactory::create_at(
     auto mesh_socket = operation_attributes.mesh_socket;
     const auto& output_tensor = tensor_args;
     auto* mesh_device = output_tensor.device();
-    IDevice* target_device = mesh_device ? mesh_device->get_device(mesh_coordinate) : tensor_args.device();
+    IDevice* target_device = mesh_device
+                                 ? tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate)
+                                 : tensor_args.device();
 
     tt::tt_metal::Program program{};
     const auto* socket_mesh_device = mesh_socket.get_config_buffer()->device();
@@ -69,7 +72,9 @@ RecvAsyncMeshWorkloadFactory::create_at(
     // TODO #24995: Find appropriate receiver cores and fabric node IDs based on mesh socket configuration
     for (uint32_t i = 0; i < socket_connection_config.size(); ++i) {
         const auto& connection = socket_connection_config[i];
-        if (socket_mesh_device->get_device(connection.receiver_core.device_coord)->id() == target_device->id()) {
+        if (tt::tt_metal::experimental::MeshDevice::get_device(
+                *socket_mesh_device, connection.receiver_core.device_coord)
+                ->id() == target_device->id()) {
             receiver_core_coords.push_back(connection.receiver_core.core_coord);
             receiver_fabric_node_ids.push_back(
                 output_tensor.device()->get_fabric_node_id(connection.receiver_core.device_coord));

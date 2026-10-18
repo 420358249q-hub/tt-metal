@@ -13,6 +13,7 @@
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/host_api.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include <sstream>
 #include <type_traits>
 
@@ -185,7 +186,9 @@ StridedAllGatherMinimalMatmulAsyncProgramFactory::create_at(
     const StridedAllGatherMinimalMatmulAsyncInputs& tensor_args,
     std::vector<Tensor>& output_tensor) {
     auto* mesh_device = tensor_args.input_tensor.device();
-    IDevice* target_device = mesh_device ? mesh_device->get_device(mesh_coordinate) : tensor_args.input_tensor.device();
+    IDevice* target_device = mesh_device
+                                 ? tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate)
+                                 : tensor_args.input_tensor.device();
 
     uint32_t device_index = ttnn::ccl::get_linearized_index_from_physical_coord(
         tensor_args.input_tensor, mesh_coordinate, attributes.strided_all_gather_async_struct.cluster_axis);

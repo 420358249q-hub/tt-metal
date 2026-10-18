@@ -14,6 +14,7 @@
 #include <tt-metalium/experimental/fabric/fabric.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/math.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include <algorithm>
 #include <sstream>
 #include <type_traits>
@@ -143,7 +144,9 @@ ttnn::device_operation::CachedProgram<AllToAllAsyncProgram::shared_variables_t> 
     Tensor& /*tensor_return_value*/) {
     log_debug(tt::LogOp, "DEBUG: create_at is called");
     auto* mesh_device = tensor_args.input_tensor.device();
-    IDevice* target_device = mesh_device ? mesh_device->get_device(mesh_coordinate) : tensor_args.input_tensor.device();
+    IDevice* target_device = mesh_device
+                                 ? tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coordinate)
+                                 : tensor_args.input_tensor.device();
 
     std::optional<IDevice*> forward_device = std::nullopt;
     std::optional<IDevice*> backward_device = std::nullopt;

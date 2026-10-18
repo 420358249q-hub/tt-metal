@@ -18,6 +18,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/work_split.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
@@ -81,7 +82,7 @@ AttnResGatherSoftmaxMeshWorkloadFactory::cached_program_t AttnResGatherSoftmaxMe
     const AttnResGatherSoftmaxInputs& tensor_args,
     std::vector<Tensor>& tensor_return_value) {
     ttnn::MeshDevice* mesh_device = tensor_args.partial.device();
-    auto* const target_device = mesh_device->get_device(mesh_coord);
+    auto* const target_device = tt::tt_metal::experimental::MeshDevice::get_device(*mesh_device, mesh_coord);
     const auto mesh_view = mesh_device->get_view();
     TT_FATAL(mesh_view.is_mesh_2d(), "attn_res_gather_softmax requires a 2D mesh to resolve the cluster axis");
 

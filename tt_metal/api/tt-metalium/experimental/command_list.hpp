@@ -15,7 +15,6 @@
 namespace tt::tt_metal::experimental {
 
 using distributed::MeshCommandQueue;
-using distributed::MeshDevice;
 using distributed::MeshWorkload;
 
 class CommandList;
@@ -35,7 +34,7 @@ public:
      *
      * @param device Mesh device to record workloads on.
      */
-    explicit CommandListBuilder(MeshDevice& device);
+    explicit CommandListBuilder(distributed::MeshDevice& device);
 
     CommandListBuilder(const CommandListBuilder&) = delete;
     CommandListBuilder& operator=(const CommandListBuilder&) = delete;
@@ -63,7 +62,7 @@ public:
     /**
      * @brief Mesh device this builder records on.
      */
-    MeshDevice& device() const;
+    distributed::MeshDevice& device() const;
 
     /**
      * @brief Clears all recorded workloads.
@@ -95,7 +94,7 @@ public:
     /**
      * @brief Mesh device this command list was built for.
      */
-    MeshDevice& device() const;
+    distributed::MeshDevice& device() const;
 
     /**
      * @brief Command-queue id this list is bound to.

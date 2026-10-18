@@ -13,6 +13,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/experimental/mesh_device.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <set>
@@ -423,9 +424,9 @@ AllToAllAsyncGenericProgram::create_at(
     // for remote coordinates, so only call it for local ones. A remote coordinate only needs a representative device to
     // complete construction; its translated NOC coordinates are never submitted by this rank. Local coordinates use
     // their own chip for harvesting-aware NOC translation.
-    tt::tt_metal::IDevice* coordinate_device = device->is_local(mesh_coordinate)
-                                                   ? device->get_device(mesh_coordinate)
-                                                   : static_cast<tt::tt_metal::IDevice*>(device);
+    tt::tt_metal::IDevice* coordinate_device =
+        device->is_local(mesh_coordinate) ? tt::tt_metal::experimental::MeshDevice::get_device(*device, mesh_coordinate)
+                                          : static_cast<tt::tt_metal::IDevice*>(device);
 
     std::vector<Tensor> input_tensors = {tensor_args.input_tensor};
     std::vector<Tensor> output_tensors = {tensor_return_value};
