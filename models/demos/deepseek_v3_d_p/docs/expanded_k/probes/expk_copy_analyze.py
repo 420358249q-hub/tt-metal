@@ -21,9 +21,9 @@ c = ["PCIe slot", "core_x", "core_y", "RISC processor type", "run host ID"]
 for risc, zone in [("TRISC_1", "EXPK-CP"), ("TRISC_0", "EXPK-WAIT")]:
     if not ((df["RISC processor type"] == risc) & (df["zone name"] == zone)).any():
         sys.exit(f"no {zone} on {risc}: apply expk_copy_probe.patch and set TT_METAL_PROFILER_SUM=1")
-for risc in ["TRISC_0", "TRISC_1", "TRISC_2"]:
+for risc, col in [("TRISC_1", "EXPK-CP"), ("TRISC_0", "EXPK-WAIT")]:
     d = df[df["RISC processor type"] == risc]
-    z = d[d["zone name"].isin(["EXPK-CP", "EXPK-WAIT"]) & (d["time[cycles since reset]"] > 0)].pivot_table(
+    z = d[(d["zone name"] == col) & (d["time[cycles since reset]"] > 0)].pivot_table(
         index=c, columns="zone name", values="data", aggfunc="max"
     )
     k = d[d["zone name"] == "TRISC-KERNEL"].pivot_table(
@@ -31,10 +31,8 @@ for risc in ["TRISC_0", "TRISC_1", "TRISC_2"]:
     )
     k = (k["ZONE_END"] - k["ZONE_START"]).rename("kernel")
     m = z.join(k, how="inner")
-    if m.empty:
-        continue
-    out = [f"{risc}: {len(m)} cores, kernel {m['kernel'].median()/1350:.0f} us"]
-    for col in ["EXPK-CP", "EXPK-WAIT"]:
-        if col in m:
-            out.append(f"{col} {(m[col]/m['kernel']).median():.2%} (p90 {(m[col]/m['kernel']).quantile(.9):.2%})")
-    print(" | ".join(out))
+    share = m[col] / m["kernel"]
+    print(
+        f"{col} on {risc}: {len(m)} cores, kernel {m['kernel'].median()/1350:.0f} us, "
+        f"share median {share.median():.2%} (p90 {share.quantile(.9):.2%})"
+    )
