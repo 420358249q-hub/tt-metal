@@ -36,11 +36,11 @@ constexpr bool reduce_trigger_supported = false;
 constexpr bool reduce_trigger_supported = true;
 #endif
 
-// SDPA_MATMUL_FIDELITY overrides the fidelity of the QK^T and softmax @ V matmuls, and of the expanded-K
-// expansion (sdpa_expand_k_chunk). A LoFi replay image is
-// specific to the matmul's shape, so each PV setup re-records it instead of reusing the last one whenever a LoFi
-// image can be live: a LoFi override, or a LoFi compute config, whose normalize_row records a LoFi image between
-// two PV setups. HiFi levels all record the same image, so HiFi over HiFi can reuse it.
+// SDPA_MATMUL_FIDELITY overrides the fidelity of the QK^T and softmax @ V matmuls, and of the expanded-K expansion
+// (sdpa_expand_k_chunk). A LoFi replay image is specific to the matmul's shape, so each PV setup re-records it instead
+// of reusing the last one whenever a LoFi image can be live: a LoFi override, or a LoFi compute config, whose
+// normalize_row records a LoFi image between two PV setups. HiFi levels all record the same image, so HiFi over HiFi
+// can reuse it.
 #ifdef SDPA_MATMUL_FIDELITY
 constexpr bool sdpa_matmul_fidelity_set = true;
 constexpr MathFidelity sdpa_matmul_fidelity = static_cast<MathFidelity>(SDPA_MATMUL_FIDELITY);
@@ -1400,10 +1400,9 @@ inline bool sdpa_packed_first_half_unmasked(
  * cb_kt_in holds the latent [c_kv | k_pe] as plain tiles in K^T tile order (tile (d, kt) at d * Sk_chunk_t + kt; the
  * reader's transposed fetch reorders tiles, and the QK transposes in-tile through its in1-transpose flag). cb_wuk holds
  * W_UK of this core's head, [no-PE rows x latent cols] latent-column-major (tile (r, d) at d * rows + r). The result
- * keeps the same contract, so the QK
- * runs unchanged at DHt_qk: rows [0, nope_rows) are K_h no-PE tiles, c_kv @ W_UK^T (W_UK's tiles transposed in-tile by
- * the same matmul flag), and rows [nope_rows, DHt_qk) are the latent's k_pe tiles, copied. Pops cb_kt_in, pushes
- * cb_kexp.
+ * keeps the same contract, so the QK runs unchanged at DHt_qk: rows [0, nope_rows) are K_h no-PE tiles,
+ * c_kv @ W_UK^T (W_UK's tiles transposed in-tile by the same matmul flag), and rows [nope_rows, DHt_qk) are the
+ * latent's k_pe tiles, copied. Pops cb_kt_in, pushes cb_kexp.
  *
  * Head groups (group > 1, expanded-K PLAN.md section 3.4): this core expands only its rank's nope_rows / group rows
  * (cb_wuk then holds only those rows of W_UK), also packs them into cb_own for the reader to send to the peer, and

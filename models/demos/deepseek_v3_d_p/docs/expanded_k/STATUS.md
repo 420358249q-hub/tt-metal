@@ -157,13 +157,13 @@ Measured at the author's request, as input for optimisation, not as a gate.
   - **What changed:**
     - The reader stores W_UK latent-column-major in `cb_wuk` (tile (r, d) at d * own_rows + r).
     - The expansion matmul is one SDPA no-MOP block (`sdpa_mm_init` / `sdpa_matmul_block_no_mop`) of rt K tiles × ct
-      W_UK rows per acquire, filling the 8-tile DST: 4 × 2 under pairs, 2 × 4 without.
+      W_UK rows per acquire, filling the DST (8 tiles with this model's bf16 dest): 4 × 2 under pairs, 2 × 4 without.
     - The no-MOP helpers take `SDPA_MATMUL_FIDELITY`, so with `sdpa_matmul_fidelity=LoFi` the expansion now runs at
       LoFi with the QK and PV. The MOP `matmul_tiles` it replaces always ran at the compute config's fidelity
       (HiFi2), whatever the SDPA override.
   - **LoFi gains (traced, expanded KV):**
-    - 5k chunks: −7.9% at KV 512k (K3 38.69 → 35.62 ms, K2.7 26.33 → 24.26 ms) and −5 to −7% at 55k.
-    - 2k chunks, which are gather-bound: −1.4 to −3.5%.
+    - 5k chunks: −7.9% at KV 512k (K3 38.69 → 35.62 ms, K2.7 26.33 → 24.26 ms) and −4.8 to −6.6% at 55k.
+    - 2k chunks, which are gather-bound: −1.3 to −3.5%.
   - **HiFi2:** unchanged within noise, bit-identical PCC.
   - **LoFi accuracy** (full output PCC vs the CPU reference) moves by at most −0.00005:
     - K3 5k 0.99819 → 0.99815, and K3 2k 0.99908 → 0.99904;
@@ -182,7 +182,8 @@ Measured at the author's request, as input for optimisation, not as a gate.
   - Batching the copies per DST acquire brought that to 3.8% but left every traced cell within noise. Packing each
     batch as one contiguous block broke correctness, and was dropped.
   - **Ceiling:** a timing-only kernel with the copies and the second pack into `cb_own` removed, every CB handshake
-    kept. It ran 1.0–1.4% faster at 5k (K3 HiFi2 512k 47.11 → 46.43 ms) and up to 2.6% at 2k.
+    kept. At KV 512k it ran 1.0–1.4% faster at 5k (K3 HiFi2 47.11 → 46.43 ms) and 0.6–2.6% at 2k; at 55k,
+    0.5–2.6%.
   - **Not pursued: expanding in place** (no-PE rows packed beside k_pe in the latent chunk, the peer writing straight
     into it):
     - it could recover at most that ceiling;
