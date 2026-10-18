@@ -2366,6 +2366,14 @@ def test_mla_tp_latent_prefetch_matches_sp_only(
             got, layer1_serial(0)
         ), f"layer 1 after set_tp_shard_kv (prefetch {prefetch_after}) with a prefetch pending"
     assert consumed == [], f"a prefetch was consumed across a chain boundary or a layout change: layers {consumed}"
+
+    # A chain's stop_layer: nothing prefetches cache layer stop_layer or beyond (a kv_only last layer), so the last
+    # layer here gathers serially; the outputs are unchanged.
+    with layers[0].tt_ccl.tp_latent_prefetch_chain(stop_layer=num_layers - 1):
+        outs = run_layers(caches["prefetch"], 0, None, None)
+    assert consumed == list(range(1, num_layers - 1)), f"stop_layer {num_layers - 1}: layers consumed {consumed}"
+    for layer in range(num_layers):
+        assert torch.equal(outs[layer], passes["prefetch"][0][layer]), f"stop_layer chain: layer {layer} differs"
     logger.success(
         f"✓ prefetch == serial == sp_only, outputs and caches bitwise, over {len(_PREFETCH_STEPS)} steps x "
         f"{num_layers} layers; layers 1..{num_layers - 1} consumed their prefetch on every step"
