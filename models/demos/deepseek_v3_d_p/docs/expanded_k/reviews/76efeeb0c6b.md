@@ -9,7 +9,7 @@ in the next commit.
 
 | # | Finding | Reviewer | Severity | Resolution |
 |---|---|---|---|---|
-| 1 | No committed test runs the expansion at LoFi (pairs 4 × 2 or un-paired 2 × 4) | Codex | minor | Added `test_mla_expanded_k_lofi`: K2.7 and K3, 5k pairs, 5k forced q160 (2 × 4 blocks), 2k pairs; expanded vs absorbed and CPU-reference checks at LoFi; asserts the SDPA program's fidelity is LoFi in both modes. All 6 pass (per-head ≥ 0.99947). Traced LoFi replay is covered by the matrix runs, not a committed test |
+| 1 | No committed test runs the expansion at LoFi (pairs 4 × 2 or un-paired 2 × 4) | Codex | minor | Added `test_mla_expanded_k_lofi`: K2.7 and K3, 5k pairs, 5k forced q160 (2 × 4 blocks), 2k pairs; expanded vs absorbed and CPU-reference checks at LoFi; asserts the SDPA program's fidelity is LoFi in both modes. All 6 pass (per-head ≥ 0.99946). Traced replay and program-cache hits at LoFi are covered by the matrix runs (traced replay of the steady-state layer, layer 1 of 3), not a committed test |
 | 2 | STATUS 2k LoFi range says −1.4%; K3 55k 2k is −1.3% | Claude | minor | −1.3 to −3.5% |
 | 3 | STATUS ceiling "1.0–1.4% at 5k" holds at KV 512k only | Claude | minor | Split by KV length (512k: 1.0–1.4% at 5k, 0.6–2.6% at 2k; 55k: 0.5–2.6%) |
 | 4 | "−5 to −7% at 55k" rounds K2.7's −4.8% | Claude | nit | −4.8 to −6.6% |

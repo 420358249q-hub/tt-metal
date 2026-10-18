@@ -111,8 +111,9 @@ def test_kimi_mla_chunked_perf_galaxy():
 
     run_model_device_perf_test_with_merge(
         command=_CMD_CHUNKED_8X4,
-        # Historical baseline: measured with unwrapped FABRIC_2D, not TorusXY.
-        expected_device_perf_ns_per_iteration=7_118_649,
+        # TorusXY Galaxy, 2026-10-18, expanded K default-on (median of 3; main measures 51.2 ms on the same host). The
+        # previous 7_118_649 was measured with unwrapped FABRIC_2D.
+        expected_device_perf_ns_per_iteration=32_350_069,
         subdir="deepseek_v3_mla",
         model_name="kimi_mla_chunked_glx_8x4",
         num_iterations=1,
@@ -149,9 +150,9 @@ def test_kimi_k3_mla_chunked_perf_galaxy():
 
     run_model_device_perf_test_with_merge(
         command=_CMD_K3_CHUNKED_8X4,
-        # Migration starting threshold: measured 2026-08-04 on bh-glx-b06u08 with unwrapped FABRIC_2D.
-        # The first certified TorusXY result must be used to recalibrate it.
-        expected_device_perf_ns_per_iteration=11_562_468,
+        # TorusXY Galaxy, 2026-10-18, expanded K default-on (median of 3; main measures 39.0 ms on the same host). The
+        # previous 11_562_468 was measured on 2026-08-04 with unwrapped FABRIC_2D.
+        expected_device_perf_ns_per_iteration=23_343_911,
         subdir="kimi_k3_mla",
         model_name="kimi_k3_mla_chunked_glx_8x4",
         num_iterations=1,
