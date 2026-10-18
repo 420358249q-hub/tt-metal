@@ -660,6 +660,7 @@ def _run_chunked_prefill(
     trace_time=False,
     poison_tp_latent_slot=False,
     num_cache_layers=1,
+    valid_rows=None,
 ):
     """Unified chunked-prefill scenario, decoupled from the reference.
 
@@ -672,6 +673,8 @@ def _run_chunked_prefill(
       * None    -> no reference (functional/perf): random inputs + random prefix, finite-output check.
     Multi-user partitions iters_isl across users (last gets the remainder); each user is independent in
     its own cache slot, so cross-user contamination surfaces as a per-user output PCC drop.
+    valid_rows: if a list, gets one [sp, chunk_local] bool mask per forward, in forward order: which chip-local
+    rows carry real tokens (the rest are padding, whose outputs are discarded).
     """
     assert reference in ("cpu", "trace", None), f"reference must be 'cpu'|'trace'|None, got {reference!r}"
     # Mutually exclusive like determinism_check vs pcc_validation in test_prefill_block: a reference
@@ -922,6 +925,8 @@ def _run_chunked_prefill(
             gather_idx = torch.tensor([min(gp, total_len - 1) for gp in flat], dtype=torch.long)
             chunk_in = users[u]["hidden"][gather_idx].clone()
             chunk_in[torch.tensor([gp >= valid_end for gp in flat])] = 0.0
+            if valid_rows is not None:
+                valid_rows.append(torch.tensor([gp < valid_end for gp in flat]).reshape(sp, chunk_local))
 
             tt_h = ttnn.from_torch(
                 chunk_in.reshape(1, 1, chunk_size_global, hidden_size),
@@ -2568,9 +2573,12 @@ class _SdpaRecorder:
         monkeypatch.setattr(ttnn.transformer, "ring_joint_scaled_dot_product_attention", recorded)
 
 
-def _per_head_pccs(a, b):
-    """PCC per (device, head) of two per-device [1, heads, rows, dim] output lists."""
-    return [comp_pcc(x[0, h], y[0, h])[1] for x, y in zip(a, b) for h in range(x.shape[1])]
+def _per_head_pccs(a, b, valid):
+    """PCC per (device, head) of two per-device [1, heads, rows, dim] output lists, over the rows that carry real tokens
+    (valid: an [sp, rows] bool mask; devices in mesh order sp * tp_size + tp). Devices with none are skipped."""
+    tp_size = len(a) // valid.shape[0]
+    rows = [valid[d // tp_size] for d in range(len(a))]
+    return [comp_pcc(x[0, h, r], y[0, h, r])[1] for x, y, r in zip(a, b, rows) if r.any() for h in range(x.shape[1])]
 
 
 # Expanded K (docs/expanded_k/PLAN.md E1/E2): K expanded per head inside the SDPA is the same attention as the absorbed
@@ -2606,7 +2614,7 @@ def _check_expanded_k_vs_absorbed(
     request, mesh_device, device_params, kwargs, use_metadata_tensor, tp_shard_kv, monkeypatch, q_chunk=None
 ):
     topology = per_axis_topology(device_params["fabric_config"])
-    outs, ref_pccs, sdpa_calls = {}, {}, {}
+    outs, ref_pccs, sdpa_calls, valid_rows = {}, {}, {}, []
     for expanded in (False, True):
         monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded else "0")
         recorder = _SdpaRecorder(monkeypatch)
@@ -2620,15 +2628,21 @@ def _check_expanded_k_vs_absorbed(
             tp_shard_kv=tp_shard_kv,
             return_outputs=True,
             return_pccs=True,
+            valid_rows=valid_rows if expanded else None,
             **kwargs,
         )
         # The mode (and a forced schedule) really took effect: a declined gate would compare absorbed with itself.
         assert sdpa_calls[expanded] and all(c["expanded"] == expanded for c in sdpa_calls[expanded]), "mode not applied"
         if expanded and q_chunk is not None:
             assert all(c["q_chunk"] == q_chunk for c in sdpa_calls[True]), f"schedule not q{q_chunk}"
-    # Per head, so a single head's expansion error is not diluted by the output projection.
-    assert len(sdpa_calls[False]) == len(sdpa_calls[True])
-    head_pccs = [p for a, e in zip(sdpa_calls[False], sdpa_calls[True]) for p in _per_head_pccs(a["out"], e["out"])]
+    # Per head, so a single head's expansion error is not diluted by the output projection. Real-token rows only:
+    # padding queries of a partial chunk can attend past a tight cache's end, where the modes need not agree.
+    assert len(sdpa_calls[False]) == len(sdpa_calls[True]) == len(valid_rows), "one SDPA call per forward"
+    head_pccs = [
+        p
+        for a, e, valid in zip(sdpa_calls[False], sdpa_calls[True], valid_rows)
+        for p in _per_head_pccs(a["out"], e["out"], valid)
+    ]
     logger.info(f"SDPA output per (device, head), expanded vs absorbed: min PCC {min(head_pccs):.6f}")
     assert min(head_pccs) >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"per-head SDPA PCC {min(head_pccs)}"
     for u, (absorbed, expanded) in enumerate(zip(outs[False], outs[True])):
