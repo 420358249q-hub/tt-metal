@@ -3030,7 +3030,9 @@ void sdpa_ring_v2(
                 continue;
             }
             // Expanded-K head groups: expand (and exchange) before the per-Q causal skip, since the peer needs this
-            // core's rows even for chunks this core's Q chunk masks out entirely.
+            // core's rows even for chunks this core's Q chunk masks out entirely. A skipped chunk then leaves the
+            // expansion's unpack/pack state (restored to the step's assumed formats, single-tile pack width) as the
+            // loop's exit state; whatever follows (the next step, the K-split epilogue) configures its own pack width.
             if constexpr (cb_kexp != INVALID_CB && k_expand_group > 1) {
                 sdpa_expand_k_chunk<
                     Sk_chunk_t,

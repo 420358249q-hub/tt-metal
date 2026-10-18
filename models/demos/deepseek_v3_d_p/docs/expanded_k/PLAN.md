@@ -119,45 +119,42 @@ in-tile transpose, no mixed transpose flags.
 - **Skipped chunks:** a core whose causal mask skips a chunk skips its expansion too. No coupling.
 - **Every schedule is supported,** with redundant work wherever a head spans several cores (K3).
 
-### 3.4 Phase 2: head groups share the expansion
+### 3.4 Phase 2: head groups share the expansion (as built: pairs)
 
-**The group.** A head group is the n cores of `head_segments[band·NH + head]`: the V head chain's existing groups
-(factory). The rules:
-- **Supported:** `max_q_per_core == 1`, B = 1, no sliding window, and n = `num_q_chunks` ∈ {1, 2, 4} (128 must split
-  into whole tile rows).
-- **Otherwise:** Phase 1's independent path; selected in the factory, never fatal.
+**The group.** A head group is the cores of `head_segments[band·NH + head]`, the V head chain's existing groups
+(factory).
+- **Built:** pairs. That is, n = `num_q_chunks` = 2 with `max_q_per_core == 1`, per-head V chains and B = 1, which
+  covers both Kimi table schedules.
+- **Not built yet:** groups of 4 (e.g. K3 at q160), which are Phase 3 work.
+- **Everything else** keeps Phase 1's independent path; the factory selects it, never fatally.
 - **All participants** are inside the SDPA sub-device (x 0–10). The Phase 3 prefetch cores (x 11, y 4–9) are never
   in a group.
-- **Groups may straddle rows,** as on the 11-wide grid: K3 head 2 spans (8..10, 0) and (0, 1). The exchange is unicast
-  and every row receives the same K chunks, so this doesn't matter.
+- **Pairs may straddle rows.** The exchange is unicast, and every row receives the same K chunks.
 
-**Participation.** Cores in a group walk the same live K chunks: the skip decisions are per device and ring_id, and
-K-split ranges are per band. Causal masking inside the diagonal chunk differs per Q chunk:
-- **Expansion:** each member expands its slice of every K chunk that **any** member needs. That is the union, which is
-  the group's last Q chunk's set.
-- **QK and PV:** a member skips them for chunks it masks out entirely.
-- **Deadlock:** no member ever waits for a slice its peer did not produce.
+**Participation.** Both cores of a pair walk the same live K chunks. The reader's skips are per device and K-split
+band; the per-Q causal skip happens only in compute. So each core expands its half of every K chunk the reader
+delivers, and only then may its compute skip QK/PV for a chunk its Q chunk masks out entirely. The skip then drains
+the assembled `cb_kexp`.
 
-**Protocol per K chunk j:**
+**Protocol per K chunk (as built), all in the reader after the chunk's V push:**
+1. Reserve this chunk's `cb_kexp_peer` slot. Increment the peer's credit semaphore (the slot is free).
+2. Wait for compute's own rows in `cb_kexp_own`. Compute packs them into its `cb_kexp` and into `cb_kexp_own`.
+3. Wait credit ≥ chunks exchanged + 1. NoC-write own rows into the peer's `cb_kexp_peer` slot, which is at the same
+   L1 address as this core's slot: identical CB layout, and both cores push and pop in lockstep. Write barrier, then
+   increment the peer's data semaphore. Pop `cb_kexp_own`.
+4. Wait data ≥ chunks exchanged + 1. Push `cb_kexp_peer`. Compute copies the peer's rows into `cb_kexp`.
 
-| Step | Kernel | Action |
-|---|---|---|
-| 1 | Compute | Expand own slice into `cb_kexp_own`, a compute → writer CB |
-| 2 | Writer (owns outbound) | Wait a slot-free credit from each peer (that peer's receive slot j mod 2 is free), NoC-write the slice into the peer's `cb_kexp_peer` slot, `noc_async_write_barrier`, increment the peer's data-valid semaphore |
-| 3 | Reader | Wait own data-valid count for chunk j, push the peer slices into `cb_kexp` |
-| 4 | Compute | Assemble with the PE rows, run QK / softmax / PV, pop; the reader then returns the slot-free credit to each sender |
+**Semaphores and ordering:**
+- Counts are cumulative; every increment is consumed before the kernel ends, and the program launch resets them.
+- The atomic barrier at reader exit flushes the increments.
+- Credit is sent before any wait, so no core waits on its peer in a cycle.
 
-- **Two receive slots** per peer, credit-based, as in `chain_link.hpp`'s ready/valid handshake.
-- **Semaphores:** two per core (credit, valid). There are 16 per core today; 9 used by the fused, batch-chain,
-  V-head-chain and K-split semaphores.
-- **Reset:** the semaphores are reset to 0 at program start, and every chunk consumes its counts, so trace replays
-  start clean.
-- **Why the writer sends:** the reader keeps fetching K^T j+1 and V j+1 while the exchange is in flight. Outbound sends
-  never block the reader's K^T multicast receive, which removes the row-multicast stall from the reader. An
-  outstanding exchange cannot block an injector, because injectors forward K^T before taking any exchange wait.
-- **Timeline:** expansion and QK share one compute pipeline. Only communication overlaps with compute: exchange j
-  against expand j+1. Phase 2 measures the exchange's exposed time and moves the sends to the reader if the writer
-  path is the bottleneck.
+**Difference from rev 2:** rev 2 had the writer send. As built, the reader both sends and receives, so it cannot fetch
+or receive K^T j+1 until the pair has exchanged chunk j. That limits K prefetch to about one chunk, and it couples a
+row's multicast to its pairs' exchanges.
+- **Result:** Phase 2 measured −20.7% to −25.1% vs absorbed (STATUS).
+- **Next lever:** moving the send to the writer, or deferring the exchange by one chunk, which only matters if the
+  profiler shows the exchange exposed.
 
 ### 3.5 Op interface, hashing, trace
 

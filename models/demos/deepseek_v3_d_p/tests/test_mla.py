@@ -2469,7 +2469,7 @@ class _SdpaRecorder:
     was expanded, the Q chunk size, the scale, and per-device host copies of the output (and, with keep_inputs, of Q, the
     latent K, V and W_UK). Device lists are in mesh order: index sp * tp_size + tp."""
 
-    def __init__(self, monkeypatch, keep_inputs=False):
+    def __init__(self, monkeypatch, keep_inputs=False, keep_device_rows=None):
         self.calls = []
         # Always wrap the real op: a second recorder in the same test must not record through the first.
         sdpa = ttnn.transformer.ring_joint_scaled_dot_product_attention
@@ -2489,6 +2489,16 @@ class _SdpaRecorder:
             }
             if keep_inputs:
                 call.update(q=host(q), k=host(k), v=host(v), w=host(weight) if weight is not None else None)
+            if keep_device_rows is not None:
+                # Device copies of Q and of the first keep_device_rows rows of K and V, and the call's arguments, to
+                # replay the op directly.
+                rows = keep_device_rows
+                call["device"] = {
+                    "q": ttnn.clone(q),
+                    "k": ttnn.slice(k, [0, 0, 0, 0], [1, 1, rows, k.shape[3]]),
+                    "v": ttnn.slice(v, [0, 0, 0, 0], [v.shape[0], v.shape[1], rows, v.shape[3]]),
+                    "kwargs": dict(kwargs),
+                }
             self.calls.append(call)
             return result
 
@@ -2573,10 +2583,14 @@ def _check_expanded_k_vs_absorbed(
         assert pcc >= _EXPANDED_K_MIN_PCC_VS_ABSORBED, f"user {u}: expanded K vs absorbed PCC {pcc}"
 
 
-# Schedules outside the measured table (forced here): no K split with one Q chunk per core (q160/k256), and several Q
-# chunks per core (q64/k256: 160 units on 110 cores at K2.7, 240 at K3), where W_UK is pushed and popped per Q chunk
-# through a double-buffered cb_wuk.
-_EXPANDED_K_FORCED_SCHEDULES = {"q160_k256": (160, 256, 1), "q64_k256": (64, 256, 1)}
+# Schedules outside the measured table (forced here): no K split with one Q chunk per core (q160/k256, every core
+# expands its whole head), several Q chunks per core (q64/k256: 160 units on 110 cores at K2.7, 240 at K3, where W_UK is
+# pushed and popped per Q chunk through a double-buffered cb_wuk), and head pairs without a K split (q320/k256, 1 split).
+_EXPANDED_K_FORCED_SCHEDULES = {
+    "q160_k256": (160, 256, 1),
+    "q64_k256": (64, 256, 1),
+    "q320_k256_nosplit": (320, 256, 1),
+}
 
 
 @pytest.mark.parametrize(
@@ -2843,4 +2857,92 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
     logger.success(
         f"✓ SDPA per (query chip, head) vs fp32 reference ({'expanded' if expanded_k else 'absorbed'} K): min PCC "
         f"{worst:.6f}, max abs error {worst_err:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((8, 4), torus_xy_device_params(l1_small_size=1152), id="torus-xy-8x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.parametrize("expanded_k", [False, True], ids=["absorbed", "expanded_k"])
+@pytest.mark.timeout(0)
+def test_ring_joint_expanded_k_causal_vs_reference(
+    request, mesh_device, device_params, variant, expanded_k, monkeypatch
+):
+    """The non-chunked causal ring_joint SDPA (Q and K one chunk each), per (query chip, head) against fp32 attention.
+    Unlike chunked prefill it skips K chunks per Q chunk (fully above the diagonal), so with expanded K in head pairs
+    (q320: two Q chunks per head; no K split outside chunked prefill) one core of a pair skips K chunks its peer
+    needs: it must still expand and exchange them and then drain the assembled K^T. The inputs are recorded from a
+    chunk-0 MLA forward (natural token order) and replayed on the op directly, K and V cut to the chunk."""
+    monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1" if expanded_k else "0")
+    sp, tp = tuple(mesh_device.shape)
+    rows = 5120 // sp
+    recorder = _SdpaRecorder(monkeypatch, keep_inputs=True, keep_device_rows=rows)
+    _run_chunked_prefill(
+        request,
+        mesh_device,
+        reference=None,
+        topology=per_axis_topology(device_params["fabric_config"]),
+        iters_isl=[5120],
+        prefill_len=0,
+    )
+    (call,) = recorder.calls
+    assert call["expanded"] == expanded_k
+    dev, kw = call["device"], call["device"]["kwargs"]
+    heads = dev["q"].shape[1] * tp
+    tt_ccl = get_tt_ccl(mesh_device)
+    sdpa = ttnn.transformer.ring_joint_scaled_dot_product_attention._recorded_op
+    out, _, _ = sdpa(
+        dev["q"],
+        dev["k"],
+        dev["v"],
+        persistent_output_buffer_k=tt_ccl.get_mla_chunked_kv_buffer(
+            cache_batch=1, seq_len=5120, kvpe_dim=dev["k"].shape[3]
+        ),
+        persistent_output_buffer_v=tt_ccl.get_mla_chunked_v_buffer(
+            seq_len=5120, num_heads=heads, v_head_dim=dev["v"].shape[3], tp_axis=1
+        ),
+        logical_n=5120,
+        program_config=kw["program_config"],
+        compute_kernel_config=kw["compute_kernel_config"],
+        dim=2,
+        multi_device_global_semaphore=kw["multi_device_global_semaphore"],
+        num_links=kw["num_links"],
+        cluster_axis=kw["cluster_axis"],
+        mesh_device=mesh_device,
+        topology=kw["topology"],
+        ccl_core_grid_offset=kw["ccl_core_grid_offset"],
+        use_column_major_ccl=True,
+        is_causal=True,
+        scale=call["scale"],
+        is_balanced=False,
+        **({"k_expand_weight": kw["k_expand_weight"]} if expanded_k else {}),
+    )
+    out = [ttnn.to_torch(d).float() for d in ttnn.get_device_tensors(out)]
+
+    def gathered(per_device, t, take):
+        return torch.cat([take(per_device[s * tp + t]) for s in range(sp)], dim=-2)
+
+    keep = torch.ones(5120, 5120, dtype=torch.bool).tril()
+    worst = 1.0
+    for t in range(tp):
+        k_latent = gathered(call["k"], t, lambda x: x[0, 0, :rows])
+        q = gathered(call["q"], t, lambda x: x[0, :, :rows])
+        v = gathered(call["v"], t, lambda x: x[0, :, :rows])
+        got = gathered(out, t, lambda x: x[0, :, :rows])
+        for h in range(q.shape[0]):
+            if expanded_k:
+                k = torch.cat([k_latent[:, :512] @ call["w"][t][0, h].T, k_latent[:, 512:]], dim=-1)
+            else:
+                k = k_latent
+            ref = torch.softmax(((q[h] @ k.T) * call["scale"]).masked_fill(~keep, float("-inf")), dim=-1) @ v[h]
+            assert torch.isfinite(got[h]).all(), f"TP group {t} head {h}: non-finite SDPA output"
+            for s in range(sp):
+                _, pcc = comp_pcc(ref[s * rows : (s + 1) * rows], got[h, s * rows : (s + 1) * rows])
+                worst = min(worst, pcc)
+                assert pcc >= 0.999, f"TP group {t} head {h} query chip {s}: causal SDPA PCC {pcc}"
+    logger.success(
+        f"✓ non-chunked causal SDPA per (query chip, head) vs fp32 ({'expanded' if expanded_k else 'absorbed'} K): min PCC {worst:.6f}"
     )

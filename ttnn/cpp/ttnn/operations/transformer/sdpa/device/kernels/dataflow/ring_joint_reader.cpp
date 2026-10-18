@@ -1568,4 +1568,8 @@ void kernel_main() {
         }
     }
     synchronize_halo();
+    if constexpr (k_expand_grouped) {
+        // The exchange's semaphore increments are non-posted atomics: flush them before the kernel exits.
+        noc_async_atomic_barrier();
+    }
 }
