@@ -28,7 +28,7 @@ The rest of the change:
 
 | | Criterion | Status | Evidence |
 |---|---|---|---|
-| E1 | Op correctness vs un-absorbed reference | ◐ | `test_ring_joint_expanded_k_per_head_vs_reference`: one chunk at position 0, full or partial (2560 valid tokens) × `sp_only` / `tp_sharded` (single-slot K) × scalar / metadata × K2.7 / K3 × absorbed / expanded. The SDPA output per (query chip, head) is compared with fp32 attention on its own inputs: 32/32, min PCC 0.99951 (gate 0.999), max abs error ≤ 0.053, finite. Rotated starts and cache-hit sequences are checked only against absorbed on the device: per (device, head) PCC ≥ 0.99962 over rotated, multi-user and partial scenarios and forced schedules. Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights` |
+| E1 | Op correctness vs un-absorbed reference | ◐ | `test_ring_joint_expanded_k_per_head_vs_reference`: one chunk at position 0, full or valid-rows-only (2560 tokens; at position 0 this adds the unwritten pad rows, not partial-chunk masking) × `sp_only` / `tp_sharded` (single-slot K) × scalar / metadata × K2.7 / K3 × absorbed / expanded. The SDPA output per (query chip, head) is compared with fp32 attention on its own inputs: 32/32, min PCC 0.99951 (gate 0.999), max abs error ≤ 0.053, finite. Rotated starts and cache-hit sequences are checked only against absorbed on the device: per (device, head) PCC ≥ 0.99962 over rotated, multi-user and partial scenarios and forced schedules. Weight address on cache hits: `test_mla_expanded_k_distinct_layer_weights` |
 | E2 | MLA PCC vs CPU reference ≥ absorbed − 0.001; `tp_sharded` == `sp_only` bitwise | ◐ | Asserted directly (the harness's `return_pccs`); over 40 user-runs, expanded is at worst 3e-6 below absorbed and at best 3.4e-5 above. `test_mla_expanded_k_matches_absorbed` (rot-multislab, rot_partial, maxedge-1u × K2.7 / K3 × scalar / metadata × `sp_only` / `tp_sharded`): 24/24 pass. With `return_outputs`, the harness runs its per-iteration 0.98 checks but not the full-region and KV-cache comparisons; the full-region PCC is returned (`return_pccs`) and compared. Expanded vs absorbed: output PCC ≥ 0.99979 (gate 0.999), and per (device, head) SDPA output PCC ≥ 0.999. `tp_sharded` == `sp_only` bitwise with expanded K: 56/56 functional scenarios. The full CPU matrix and the K3 golden trace are not run yet |
 | E3 | ≥ 15% faster at K3 512k / K2.7 256k, ≥ 8% at 50k | ◐ | K2.7 256k −16.3%, K2.7 50k −14.1%, K3 50k −12.5%, K3 512k −14.6% (just under 15%: Phase 2) |
 | E4 | Multi-layer trace with distinct weights | ◐ | X4 `expanded_k` (K2.7, K3): 3 layers with distinct per-layer `kv_b`, 2 users, a segmented capture with the prefetch, allocation tracking. Traced == eager == `sp_only`, bitwise: 4/4 with absorbed. All three paths are expanded, so X4 would not see a stale weight address; `test_mla_expanded_k_distinct_layer_weights` checks that. Prefetch off is not traced yet |
@@ -82,12 +82,18 @@ schedule:
   bound: the 7.2 ms also includes the narrower Q read and other non-MAC savings.
   - **Lower end:** a peak-based estimate (HiFi2, about 2 k MACs per cycle per core, 200–340 K chunks per core) puts
     the expansion at roughly 30–50% of FPU peak, against QK's ≈ 70% math utilisation. That ratio is roughly
-    0.43–0.73.
-  - **So the 60% floor is not established.** What it guards, a net gain, is measured directly (−14% to −16% at three
-    of four points, with the expansion still 2× redundant). A blocked (multi-tile) expansion matmul is the lever if
+    0.43–0.71.
+  - **So the 60% floor is not established.** What it guards, a net gain, is measured directly (−12.5% to −16.3% at all four
+    points, with the expansion still 2× redundant). A blocked (multi-tile) expansion matmul is the lever if
     throughput matters after Phase 2.
 - **What's left:** the expansion is still 2× redundant (both Q-chunk cores of a head in a band expand it). Phase 2's
   exchange would save ≈ 2 ms more here, for ≈ −26% SDPA vs absorbed.
+
+**Decision (2026-10-18): Phase 1's stop criterion (expansion ≥ 60% of QK's MAC throughput) is waived, not passed.**
+- Its purpose is to stop when the expansion cannot pay for itself. The measured gains already show that it does.
+- Phase 2 is the step that tests the remaining question directly: halving the expansion should move the SDPA by about
+  as much as the expansion's measured cost.
+- This is recorded here for the author to confirm.
 
 ## Next steps
 

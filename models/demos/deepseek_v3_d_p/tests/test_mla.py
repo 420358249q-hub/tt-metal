@@ -2616,8 +2616,8 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
     expanded vs absorbed (whose wkv_b1 matmul is a separate op) must agree per layer and step, on the TP-sharded cache
     with the prefetch on, metadata path. Separately, on sp_only and one cache layer, layers that differ only in their
     weights must share every program (no new program-cache entry), which shows the address is patched rather than
-    keyed. That sharing is not asserted on the tp_sharded path above, where the SDPA program is also keyed by cache
-    layer on the metadata path."""
+    keyed. That sharing is not asserted on the tp_sharded path above (there the SDPA reads the single-slot TP latent
+    buffer at layer 0, so cache layer does not key it, but the gather and cache-write programs differ per layer)."""
     monkeypatch.setenv("PREFILL_MLA_EXPANDED_K", "1")
     config, weights = request.getfixturevalue("random_weights")
     sp_axis, tp_axis = 0, 1
@@ -2750,6 +2750,9 @@ def test_mla_expanded_k_distinct_layer_weights(request, mesh_device, device_para
         mla_layer._expanded_k = True
     cache = new_cache(tp_sharded=False)
     set_step(0)
+    # Start cold, so layer 0 must compile (a reused mesh may already hold these programs).
+    mesh_device.disable_and_clear_program_cache()
+    mesh_device.enable_program_cache()
     before = mesh_device.num_program_cache_entries()
     forward_layer(cache, 0, 0)
     entries = mesh_device.num_program_cache_entries()
@@ -2782,8 +2785,9 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
     request, mesh_device, device_params, variant, expanded_k, tp_shard_kv, use_metadata_tensor, valid, monkeypatch
 ):
     """E1: the ring_joint SDPA output per head against fp32 attention on the device's own inputs, for one chunk at
-    position 0 (natural token order: chip s holds tokens s*640..s*640+639), full or partial (keys past the valid tokens
-    masked, pad query rows not compared). Expanded: K_h = [c_kv @ W_UK_h^T | k_pe] and Q un-absorbed; absorbed: the latent
+    position 0 (natural token order: chip s holds tokens s*640..s*640+639), full or partial. At position 0 a partial chunk
+    is the full one restricted to its valid query rows (causally they see no pad keys); it adds the unwritten pad rows
+    of the cache and buffers, not partial-chunk masking, which is checked against absorbed only. Expanded: K_h = [c_kv @ W_UK_h^T | k_pe] and Q un-absorbed; absorbed: the latent
     K and Q. Causal. K is the cache slot (sp_only) or the TP latent buffer (tp_sharded). K2.7's three K-split bands
     leave some bands empty on chunk 0. PCC is checked per (query chip, head): output norms fall with the row index, so
     one PCC over all rows would be dominated by chip 0, whose queries read only local K."""
@@ -2824,6 +2828,7 @@ def test_ring_joint_expanded_k_per_head_vs_reference(
                 k = k_latent
             scores = ((q[h] @ k.T) * call["scale"]).masked_fill(~keep, float("-inf"))
             ref = torch.softmax(scores, dim=-1) @ v[h]
+            assert torch.isfinite(ref[:valid]).all(), f"TP group {t} head {h}: non-finite reference"
             assert torch.isfinite(out[h, :valid]).all(), f"TP group {t} head {h}: non-finite SDPA output"
             for s in range(sp):
                 lo, hi = s * rows, min((s + 1) * rows, valid)
