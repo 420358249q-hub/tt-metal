@@ -255,14 +255,17 @@ def run_model_device_perf_test_with_merge(
         between_signposts: If set to (start_header, stop_header), restricts the
             measurement to device ops emitted between those two tracy signposts
             (e.g. ("MLA_START", "MLA_END")), excluding everything dispatched before
-            the first start / after the last stop — such as one-time weight-load
-            tilize/typecast at construction. Each iteration's CSV must hold exactly one
-            start/stop pair (see ops_in_signposted_region); otherwise the test fails.
+            the start / after the stop — such as one-time weight-load tilize/typecast
+            at construction. The profiling run's CSV must hold exactly one start/stop
+            pair (see ops_in_signposted_region), and num_iterations must be 1: only
+            the last run's CSV is read, so its merged sum would stand in for all.
         extra_env: If set, applied to os.environ for the duration of the subprocess
             invocation. Use for vars the worker reads directly (e.g. TT_DS_CAPTURED_LAYER)
             — prefixing them into the command doesn't work because tracy's -m flag
             mis-parses leading KEY=VAL tokens as module names.
     """
+    if between_signposts is not None and num_iterations != 1:
+        pytest.fail(f"between_signposts needs num_iterations=1 (got {num_iterations}): only the last run is merged")
     cols = ["DEVICE FW", "DEVICE KERNEL", "DEVICE BRISC KERNEL"]
     inference_time_key = "AVG DEVICE KERNEL DURATION [ns]"
 
@@ -285,7 +288,7 @@ def run_model_device_perf_test_with_merge(
     df = pd.read_csv(filename)
 
     total_rows = len(df)
-    signpost_rows = len(df[df["OP TYPE"] == "tt_signpost"])
+    signpost_rows = len(df[df["OP TYPE"] == "signpost"])
     device_rows = len(df[df["OP TYPE"] == "tt_dnn_device"])
 
     logger.debug(f"CSV total rows: {total_rows}, signposts: {signpost_rows}, device ops: {device_rows}")

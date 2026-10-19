@@ -5,6 +5,7 @@
 import pandas as pd
 import pytest
 
+from models.demos.deepseek_v3_d_p.utils import perf_utils
 from models.demos.deepseek_v3_d_p.utils.perf_utils import ops_in_signposted_region
 
 _REGION = ("MLA_START", "MLA_END")
@@ -62,7 +63,45 @@ def test_anything_but_one_region_fails(rows, expect_error):
         ops_in_signposted_region(_ops_csv(rows), _REGION)
 
 
-def test_empty_region_fails(expect_error):
-    df = _ops_csv([_signpost("MLA_START"), _signpost("MLA_END"), _device("Matmul")])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [_signpost("MLA_START"), _signpost("MLA_END"), _device("Matmul")],
+        # The stop before the start.
+        [_signpost("MLA_END"), _device("Matmul"), _signpost("MLA_START")],
+    ],
+    ids=["empty", "stop_first"],
+)
+def test_no_ops_inside_fails(rows, expect_error):
     with expect_error(pytest.fail.Exception, "matched no device rows"):
-        ops_in_signposted_region(df, _REGION)
+        ops_in_signposted_region(_ops_csv(rows), _REGION)
+
+
+def _wrapper_kwargs(**extra):
+    return dict(
+        command="pytest x",
+        expected_device_perf_ns_per_iteration=None,
+        subdir="sub",
+        model_name="m",
+        between_signposts=_REGION,
+        **extra,
+    )
+
+
+def test_wrapper_rejects_several_iterations_before_profiling(monkeypatch, expect_error):
+    """Only the last profiling run's CSV is merged, so a signposted measurement over several iterations is refused
+    before anything runs."""
+    monkeypatch.setattr(perf_utils, "run_device_perf", lambda *a, **k: pytest.fail("profiled"))
+    with expect_error(pytest.fail.Exception, "needs num_iterations=1"):
+        perf_utils.run_model_device_perf_test_with_merge(**_wrapper_kwargs(num_iterations=3))
+
+
+def test_wrapper_rejects_a_run_with_several_regions(monkeypatch, tmp_path, expect_error):
+    """One profiling run whose CSV holds three forwards (an unpinned -k axis) fails instead of summing them."""
+    csv = tmp_path / "ops.csv"
+    rows = [r for _ in range(3) for r in (_signpost("MLA_START"), _device("Matmul"), _signpost("MLA_END"))]
+    _ops_csv(rows).to_csv(csv, index=False)
+    monkeypatch.setattr(perf_utils, "run_device_perf", lambda *a, **k: {})
+    monkeypatch.setattr(perf_utils, "get_latest_ops_log_filename", lambda subdir: str(csv))
+    with expect_error(pytest.fail.Exception, "expected one region per profiling run"):
+        perf_utils.run_model_device_perf_test_with_merge(**_wrapper_kwargs(num_iterations=1))
