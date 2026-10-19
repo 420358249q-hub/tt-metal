@@ -100,8 +100,41 @@ def test_wrapper_rejects_a_run_with_several_regions(monkeypatch, tmp_path, expec
     """One profiling run whose CSV holds three forwards (an unpinned -k axis) fails instead of summing them."""
     csv = tmp_path / "ops.csv"
     rows = [r for _ in range(3) for r in (_signpost("MLA_START"), _device("Matmul"), _signpost("MLA_END"))]
-    _ops_csv(rows).to_csv(csv, index=False)
+    _ops_csv(rows).assign(**{"DEVICE KERNEL DURATION [ns]": 1000.0}).to_csv(csv, index=False)
     monkeypatch.setattr(perf_utils, "run_device_perf", lambda *a, **k: {})
     monkeypatch.setattr(perf_utils, "get_latest_ops_log_filename", lambda subdir: str(csv))
+
+    def merge_reached(df):
+        raise AssertionError(f"merged {len(df)} rows from several regions")
+
+    monkeypatch.setattr(perf_utils, "merge_device_rows", merge_reached)
     with expect_error(pytest.fail.Exception, "expected one region per profiling run"):
         perf_utils.run_model_device_perf_test_with_merge(**_wrapper_kwargs(num_iterations=1))
+
+
+def test_wrapper_gates_the_merged_total_inside_the_region(monkeypatch, tmp_path):
+    """A pinned single-region run: the checked value is the merged device time inside the region (300 ns), not the
+    profiler's unfiltered total, which also counts the weight-load tilize outside it."""
+    csv = tmp_path / "ops.csv"
+    rows = [
+        _device("Tilize"),
+        _signpost("MLA_START"),
+        _device("Matmul"),
+        _device("RingJointSDPA"),
+        _signpost("MLA_END"),
+    ]
+    _ops_csv(rows).assign(**{"DEVICE KERNEL DURATION [ns]": [5000.0, None, 100.0, 200.0, None]}).to_csv(
+        csv, index=False
+    )
+    unfiltered = {"AVG DEVICE KERNEL DURATION [ns]": 5300.0}
+    monkeypatch.setattr(perf_utils, "run_device_perf", lambda *a, **k: dict(unfiltered))
+    monkeypatch.setattr(perf_utils, "get_latest_ops_log_filename", lambda subdir: str(csv))
+    monkeypatch.setattr(perf_utils, "merge_device_rows", lambda df: df)  # one device: nothing to merge
+    gated, reported = [], []
+    monkeypatch.setattr(perf_utils, "check_device_perf", lambda results, **k: gated.append(dict(results)) or {})
+    monkeypatch.setattr(perf_utils, "prep_device_perf_report", lambda **k: reported.append(k["post_processed_results"]))
+    perf_utils.run_model_device_perf_test_with_merge(
+        **{**_wrapper_kwargs(), "expected_device_perf_ns_per_iteration": 300}
+    )
+    assert gated == [{"AVG DEVICE KERNEL DURATION [ns]": 300.0}]
+    assert reported[0]["AVG DEVICE KERNEL DURATION [ns]"] == 300.0
