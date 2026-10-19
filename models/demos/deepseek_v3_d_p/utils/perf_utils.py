@@ -191,6 +191,33 @@ def approximate_mla_galaxy_perf(csv_2x4: str, csv_8x4: str | None = None, use_av
     return df_result
 
 
+def ops_in_signposted_region(df, between_signposts: tuple[str, str], filename: str = "ops CSV"):
+    """The non-signpost rows of one profiling run's ops CSV inside its single start/stop signpost region.
+
+    Each run_device_perf iteration is a separate profiling run whose CSV is read on its own, so the CSV must hold
+    exactly one region: the regions would be summed, so a -k selection matching more tests, or a test running more
+    forwards, would silently multiply the measurement.
+    """
+    start_header, stop_header = between_signposts
+    sp = df["OP TYPE"] == "signpost"
+    is_start = sp & (df["OP CODE"] == start_header)
+    is_stop = sp & (df["OP CODE"] == stop_header)
+    starts, stops = int(is_start.sum()), int(is_stop.sum())
+    if starts != 1 or stops != 1:
+        pytest.fail(
+            f"between_signposts={between_signposts!r}: expected one region per profiling run, found "
+            f"starts={starts}, stops={stops} in {filename}; pin every -k axis to one test of one forward"
+        )
+    # CSV rows are in host-dispatch order; +1 at the start, -1 at the stop. A row is "inside" when the running depth
+    # is > 0. The start row itself raises depth to 1, so it is excluded only by ~sp (signpost rows are never device
+    # ops); the stop row drops depth to 0.
+    depth = (is_start.astype(int) - is_stop.astype(int)).cumsum()
+    inside = df[(depth > 0) & ~sp]
+    if inside.empty:
+        pytest.fail(f"between_signposts={between_signposts!r} matched no device rows in {filename}")
+    return inside
+
+
 def run_model_device_perf_test_with_merge(
     command: str,
     expected_device_perf_ns_per_iteration: float | None,
@@ -229,8 +256,8 @@ def run_model_device_perf_test_with_merge(
             measurement to device ops emitted between those two tracy signposts
             (e.g. ("MLA_START", "MLA_END")), excluding everything dispatched before
             the first start / after the last stop — such as one-time weight-load
-            tilize/typecast at construction. Handles repeated/nested pairs (only ops
-            inside an open region are kept).
+            tilize/typecast at construction. Each iteration's CSV must hold exactly one
+            start/stop pair (see ops_in_signposted_region); otherwise the test fails.
         extra_env: If set, applied to os.environ for the duration of the subprocess
             invocation. Use for vars the worker reads directly (e.g. TT_DS_CAPTURED_LAYER)
             — prefixing them into the command doesn't work because tracy's -m flag
@@ -264,29 +291,7 @@ def run_model_device_perf_test_with_merge(
     logger.debug(f"CSV total rows: {total_rows}, signposts: {signpost_rows}, device ops: {device_rows}")
 
     if between_signposts is not None:
-        start_header, stop_header = between_signposts
-        sp = df["OP TYPE"] == "signpost"
-        is_start = sp & (df["OP CODE"] == start_header)
-        is_stop = sp & (df["OP CODE"] == stop_header)
-        if not is_start.any() or not is_stop.any():
-            pytest.fail(
-                f"between_signposts={between_signposts!r}: signpost(s) not found in {filename} "
-                f"(found starts={int(is_start.sum())}, stops={int(is_stop.sum())})"
-            )
-        # The regions are summed, so a -k selection matching more tests (or a test running more forwards) would
-        # silently multiply the measurement: each iteration must be exactly one region.
-        if int(is_start.sum()) != num_iterations or int(is_stop.sum()) != num_iterations:
-            pytest.fail(
-                f"between_signposts={between_signposts!r}: expected {num_iterations} region(s), found "
-                f"starts={int(is_start.sum())}, stops={int(is_stop.sum())} in {filename}; pin every -k axis"
-            )
-        # CSV rows are in host-dispatch order; +1 at each start, -1 at each stop. A row is "inside"
-        # an open region when the running depth is > 0. The start row itself raises depth to 1, so it
-        # is excluded only by ~sp (signpost rows are never device ops); the stop row drops depth to 0.
-        depth = (is_start.astype(int) - is_stop.astype(int)).cumsum()
-        df = df[(depth > 0) & ~sp]
-        if df.empty:
-            pytest.fail(f"between_signposts={between_signposts!r} matched no device rows in {filename}")
+        df = ops_in_signposted_region(df, between_signposts, filename)
         logger.debug(f"Rows between signposts {between_signposts}: {len(df)}")
 
     df = df[df["OP TYPE"].isin(["tt_dnn_device"])]

@@ -56,7 +56,8 @@ _CMD_MISTRAL4_CHUNKED_8X4 = (
     f"pytest {_CHUNKED_TEST_PATH} "
     "-k 'deep-50k+5k and mistral4 and func and torus-xy-8x4 and scalar and no_determinism and sp_only'"
 )
-# Record-only: one local run on DDR 14000, so the margin admits any measurement. Replace both with the first certified TorusXY CI result.
+# Record-only: one local run on DDR 14000, so the margin admits any measurement. Replace both with the first certified
+# TorusXY CI result.
 _MISTRAL4_MLA_CHUNKED_NS_UNCALIBRATED = 3_301_775
 
 # Measures the actual SP8/TP1 shape; approximate_mla_galaxy_perf pins TP=4 and cannot express it.

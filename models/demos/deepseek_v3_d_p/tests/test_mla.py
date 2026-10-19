@@ -528,8 +528,8 @@ DETERMINISM_REPS = 3
 # Realtime ("lightweight") profiler perf gate: in-process device program records, so no Tracy
 # subprocess, no signposts and no ops-CSV re-parse -- it runs on the plain build. Not comparable to
 # the Tracy path's number -- Tracy averages collectives across chips, this takes the max.
-# Measured 2026-10-18 on the TorusXY Galaxy (DDR 14000) with expanded K default-on for Kimi (median of 3: 6.359 / 6.368 /
-# 6.377 ms).
+# Measured 2026-10-18 on the TorusXY Galaxy (DDR 14000) with expanded K default-on for Kimi, median of 3:
+# 6.359 / 6.368 / 6.377 ms.
 K3_CHUNKED_RT_PERF_NS = 6_368_000
 K3_CHUNKED_RT_PERF_MARGIN = 0.03
 
