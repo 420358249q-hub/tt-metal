@@ -27,14 +27,33 @@ FAMILY_DIRS = (
 )
 COUNT_FILE = Path("tests/pipeline_reorg/ttnn_matmul_fused_reduction_ops.count")
 _COLLECTED_RE = re.compile(r"(\d+)(?:/\d+)? tests collected")
+# Hex SHAs, origin/<ref>, and simple branch names. A leading '-' is rejected so
+# `git diff` cannot treat --base as an option (do not put `--` before the
+# revisions: git would then take them as pathspecs).
+_REV_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+_GIT_SUBCOMMANDS = frozenset({"cat-file", "fetch", "diff"})
 
 
 def _repo() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _run(cmd: list[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=check)
+def _require_rev(rev: str) -> str:
+    if not _REV_RE.fullmatch(rev):
+        raise ValueError(f"invalid git revision {rev!r}")
+    return rev
+
+
+def _git(subcommand: str, args: list[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess:
+    # argv list, no shell. Subcommand is allowlisted; revisions are validated. This
+    # replaces a generic `_run(cmd)` that Cycode SAST treated as command injection.
+    if subcommand not in _GIT_SUBCOMMANDS:
+        raise ValueError(f"unsupported git subcommand {subcommand!r}")
+    result = subprocess.run(["git", subcommand, *args], cwd=cwd, capture_output=True, text=True, check=False)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"git {subcommand} failed: {detail[-500:]}")
+    return result
 
 
 def _expected_count(text: str) -> int:
@@ -55,7 +74,7 @@ def _collected_count(output: str) -> int:
 def check_count() -> int:
     repo = _repo()
     expected = _expected_count((repo / COUNT_FILE).read_text())
-    result = _run(
+    result = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -69,6 +88,9 @@ def check_count() -> int:
             *FAMILY_DIRS,
         ],
         cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     output = result.stdout + result.stderr
     if result.returncode != 0:
@@ -86,25 +108,26 @@ def check_count() -> int:
 
 
 def _have_commit(rev: str, cwd: Path) -> bool:
-    return _run(["git", "cat-file", "-e", f"{rev}^{{commit}}"], cwd=cwd).returncode == 0
+    return _git("cat-file", ["-e", "--", f"{rev}^{{commit}}"], cwd=cwd).returncode == 0
 
 
 def _resolve_base(explicit: str | None) -> str:
     if explicit:
-        return explicit
+        return _require_rev(explicit)
     for key in ("GITHUB_EVENT_PULL_REQUEST_BASE_SHA", "GITHUB_BASE_SHA"):
         value = os.environ.get(key)
         if value:
-            return value
+            return _require_rev(value)
     base_ref = os.environ.get("GITHUB_BASE_REF") or "main"
-    return base_ref if "/" in base_ref else f"origin/{base_ref}"
+    return _require_rev(base_ref if "/" in base_ref else f"origin/{base_ref}")
 
 
 def _ensure_revision(rev: str, cwd: Path) -> str:
+    rev = _require_rev(rev)
     if _have_commit(rev, cwd):
         return rev
-    fetch_ref = rev.removeprefix("origin/")
-    _run(["git", "fetch", "--depth=1", "origin", fetch_ref], cwd=cwd, check=True)
+    fetch_ref = _require_rev(rev.removeprefix("origin/"))
+    _git("fetch", ["--depth=1", "--", "origin", fetch_ref], cwd=cwd, check=True)
     if _have_commit(rev, cwd):
         return rev
     if _have_commit("FETCH_HEAD", cwd):
@@ -120,8 +143,11 @@ def _is_family_test(path: str) -> bool:
 
 
 def _changed_test_files(base: str, cwd: Path) -> list[str]:
-    result = _run(
-        ["git", "diff", "--name-only", "--diff-filter=AMR", "-M", f"{base}...HEAD"],
+    # Two-dot compare (base tree vs HEAD). Three-dot (base...HEAD) needs a merge-base,
+    # which a shallow CI fetch of the base SHA does not have.
+    result = _git(
+        "diff",
+        ["--name-only", "--diff-filter=AMR", "-M", base, "HEAD"],
         cwd=cwd,
         check=True,
     )
@@ -130,8 +156,12 @@ def _changed_test_files(base: str, cwd: Path) -> list[str]:
 
 def run_changed(explicit_base: str | None, dry_run: bool) -> int:
     repo = _repo()
-    base = _ensure_revision(_resolve_base(explicit_base), repo)
-    targets = _changed_test_files(base, repo)
+    try:
+        base = _ensure_revision(_resolve_base(explicit_base), repo)
+        targets = _changed_test_files(base, repo)
+    except (RuntimeError, ValueError) as exc:
+        sys.stderr.write(f"changed-test gate: {exc}\n")
+        return 1
     if not targets:
         print(f"changed-test gate: no matmul/fused/reduce test files changed vs {base}")
         return 0
@@ -140,6 +170,9 @@ def run_changed(explicit_base: str | None, dry_run: bool) -> int:
         print(f"  {target}")
     if dry_run:
         return 0
+    if any(not _is_family_test(target) for target in targets):
+        sys.stderr.write("changed-test gate: refusing to run a path outside matmul/fused/reduce\n")
+        return 1
     return subprocess.run(
         [sys.executable, "-m", "pytest", "--timeout", "60", "-xv", *targets],
         cwd=repo,
