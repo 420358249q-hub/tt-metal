@@ -26,14 +26,11 @@ inline void calculate_silu_bw_bf16() {
             vFloat core_n = core_f - 12582912.0f;
             vInt core_k = as<vInt>(core_f) - 1262485504;
             vFloat core_r = core_t - core_n;
-            vFloat core = 0.0013266970636323094f;
-            core = core * core_r + 0.009675459936261177f;
-            core = core * core_r + 0.05550742521882057f;
-            core = core * core_r + 0.24022121727466583f;
-            core = core * core_r + 0.6931469440460205f;
-            core = core * core_r + 1.0000001192092896f;
-            v_if(setsgn(core_t, 0) < 1.4901161193847656e-08f) { core = 1.0f; }
-            v_endif;
+            vFloat core = 0.00958237424492836f;
+            core = core * core_r + 0.05590646713972092f;
+            core = core * core_r + 0.24024108052253723f;
+            core = core * core_r + 0.6931241750717163f;
+            core = core * core_r + 1.0f;
             vInt core_e = exexp(core, ExponentMode::Biased) + core_k + 64;
             v_if(core_e <= 0) { core = 0.0f; }
             v_else { core = setexp(core, core_e); }
