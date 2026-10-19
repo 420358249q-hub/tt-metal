@@ -25,13 +25,10 @@ inline void calculate_selu_bw_bf16() {
         vFloat e0s_n = e0s_f - 12582912.0f;
         vInt e0s_k = as<vInt>(e0s_f) - 1262485504;
         vFloat e0s_r = e0s_t - e0s_n;
-        vFloat e0s = 0.009560510516166687f;
-        e0s = e0s * e0s_r + 0.05591703951358795f;
-        e0s = e0s * e0s_r + 0.24024981260299683f;
-        e0s = e0s * e0s_r + 0.6931219696998596f;
-        e0s = e0s * e0s_r + 0.9999991655349731f;
-        v_if(setsgn(e0s_t, 0) < 1.4901161193847656e-08f) { e0s = 1.0f; }
-        v_endif;
+        vFloat e0s = 0.05500870198011398f;
+        e0s = e0s * e0s_r + 0.24221089482307434f;
+        e0s = e0s * e0s_r + 0.693282961845398f;
+        e0s = e0s * e0s_r + 1.0f;
         vInt e0s_e = exexp(e0s, ExponentMode::Biased) + e0s_k + 64;
         v_if(e0s_e <= 0) { e0s = 0.0f; }
         v_else { e0s = setexp(e0s, e0s_e); }
