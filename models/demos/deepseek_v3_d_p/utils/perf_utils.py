@@ -273,6 +273,13 @@ def run_model_device_perf_test_with_merge(
                 f"between_signposts={between_signposts!r}: signpost(s) not found in {filename} "
                 f"(found starts={int(is_start.sum())}, stops={int(is_stop.sum())})"
             )
+        # The regions are summed, so a -k selection matching more tests (or a test running more forwards) would
+        # silently multiply the measurement: each iteration must be exactly one region.
+        if int(is_start.sum()) != num_iterations or int(is_stop.sum()) != num_iterations:
+            pytest.fail(
+                f"between_signposts={between_signposts!r}: expected {num_iterations} region(s), found "
+                f"starts={int(is_start.sum())}, stops={int(is_stop.sum())} in {filename}; pin every -k axis"
+            )
         # CSV rows are in host-dispatch order; +1 at each start, -1 at each stop. A row is "inside"
         # an open region when the running depth is > 0. The start row itself raises depth to 1, so it
         # is excluded only by ~sp (signpost rows are never device ops); the stop row drops depth to 0.
